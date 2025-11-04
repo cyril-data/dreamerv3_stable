@@ -1,0 +1,6 @@
+*.pyc
+*.png
+*.svg
+mlruns/
+outputs/
+.vscode/
