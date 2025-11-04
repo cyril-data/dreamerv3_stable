@@ -8,46 +8,6 @@ from src.configure import (
     configure_model,
     configure_policy,
 )
-import gymnasium as gym
-import os
-
-
-# Fonction pour lister les wrappers
-def list_wrappers(env):
-    wrappers = []
-    while isinstance(env, gym.Wrapper):
-        wrappers.append(type(env).__name__)
-        env = env.env  # Accéder à l'environnement enveloppé
-    return wrappers
-
-
-def analyser_parametres_partages(model):
-    policy = model.policy
-
-    print("=== FEATURES EXTRACTORS ===")
-    print(f"pi_features_extractor id: {id(policy.pi_features_extractor)}")
-    print(f"vf_features_extractor id: {id(policy.vf_features_extractor)}")
-    print(f"Partagé: {id(policy.pi_features_extractor) == id(policy.vf_features_extractor)}")
-
-    print("\n=== MLP EXTRACTOR ===")
-    print(f"mlp_extractor id: {id(policy.mlp_extractor)}")
-    print(f"latent policy_net params: {sum(p.numel() for p in policy.mlp_extractor.latent_policy_net.parameters())}")
-    print(f"latent value_net params: {sum(p.numel() for p in policy.mlp_extractor.latent_value_net.parameters())}")
-    print(f"latent sf_net params: {sum(p.numel() for p in policy.mlp_extractor.latent_sf_net.parameters())}")
-
-    print("\n=== OPTIMISEUR ===")
-    print(f"Optimiseur unique: {id(policy.optimizer)}")
-    print(f"Nombre total de paramètres: {sum(p.numel() for p in policy.parameters())}")
-
-    print("\n=== DÉTAIL DES PARAMÈTRES ===")
-    for name, param in policy.named_parameters():
-        print(f"{name}: {param.shape} - {param.numel()} params")
-
-    pytorch_total_params = sum(p.numel() for p in policy.parameters())
-
-    print("Total params", pytorch_total_params)
-
-    print("model.policy", model.policy)
 
 
 def main(args):
@@ -75,12 +35,6 @@ def main(args):
         # logger
         model.set_logger(logger)
 
-        print("-" * 80)
-        print("-" * 80)
-        print(
-            f"Même objet features_extractor: {id(model.policy.pi_features_extractor) == id(model.policy.vf_features_extractor)}"
-        )
-        analyser_parametres_partages(model)
         # Begin training
         model.learn(total_timesteps=args.it, callback=callbacks)
 

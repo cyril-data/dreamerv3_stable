@@ -1,5 +1,5 @@
-# Action continouous GridWorld for RL Training Framework with Successor feature
-
+# Dreamer V3
+ 
 This project provides a reinforcement learning training framework for action continouous GridWorld environments using Stable Baselines3. It supports various algorithms and allows for customizable configurations through command line arguments and YAML configuration files.
 
 ## Table of Contents
@@ -98,7 +98,6 @@ The framework includes several callback classes to enhance training:
 
 - **MyEvalCallback**: Evaluates the model during training and saves the best model.
 - **SaveConfigCallback**: Saves the configuration used for training.
-- **PlotCallback**: Visualizes specifics on training progress.
 
 ## Logger
 
@@ -110,7 +109,7 @@ Logging is set up using `MLflow` and console output. You can monitor training pr
 
 ## Model Configuration
 
-The framework allows you to configure and instantiate various reinforcement learning models. It supports algorithms such as PPO, PPO_SF... Models can be loaded from saved checkpoints to continue training.
+The framework allows you to configure and instantiate various reinforcement learning models. It supports algorithms such as PPO, SAC, **but built to test DreamerV3**. Models can be loaded from saved checkpoints to continue training.
 
 ## Run on supercomputers
 
@@ -120,7 +119,7 @@ module load python/3.10.4
 module load openmpi
 ```
 
-And you can adapt your own script in `./script` dir. 
+<!-- And you can adapt your own script in `./script` dir.  -->
 
 ## License
 

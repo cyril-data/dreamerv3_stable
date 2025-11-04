@@ -23,16 +23,8 @@ from argparse import Namespace
 from stable_baselines3.common.callbacks import BaseCallback
 from env.nav_2d import draw_walls
 import gymnasium as gym
-
+from src.utils import make_file_path
 import time
-
-
-def make_file_path(path_dir, file_name):
-    if path_dir.startswith("file://"):
-        input_string = path_dir[7:]
-
-    file_path = "/".join((input_string, file_name))
-    return file_path
 
 
 class SaveConfigCallback(BaseCallback):
