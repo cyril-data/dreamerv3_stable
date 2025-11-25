@@ -235,7 +235,7 @@ class DreamerV3(OffPolicyAlgorithm):
         buffer_size: int = 1_000_000,  # 1e6
         learning_starts: int = 1000,
         batch_size: int = 256,
-        batch_length: int = 64,  # batch_length determines the loop length for recurent state model
+        sequence_length: int = 32,  # sequence_length determines the loop length for recurent state model
         tau: float = 0.005,
         gamma: float = 0.99,
         train_freq: Union[int, tuple[int, str]] = 1,
@@ -286,7 +286,7 @@ class DreamerV3(OffPolicyAlgorithm):
             support_multi_env=True,
         )
 
-        self.batch_length = batch_length
+        self.sequence_length = sequence_length
         self.target_entropy = target_entropy
         self.log_ent_coef = None  # type: Optional[th.Tensor]
         # Entropy coefficient / Entropy temperature
@@ -354,7 +354,7 @@ class DreamerV3(OffPolicyAlgorithm):
 
         for gradient_step in range(gradient_steps):
             # Sample replay buffer
-            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
+            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env, sequence_length=self.sequence_length)  # type: ignore[union-attr]
 
             # We need to sample because `log_std` may have changed between two gradient steps
             if self.use_sde:
@@ -362,15 +362,30 @@ class DreamerV3(OffPolicyAlgorithm):
 
             # =============================================================================
             # --- World model training
+            print("*" * 80)
+            print("*" * 80)
+            print("World model training")
+            print("*" * 80)
+            print("*" * 80)
+
+            # Transform [batch_size, sequence_length, obs.shape] → [batch_size * sequence_length, obs_shape]
+            flat_observations = replay_data.observations.view(-1, 2)
+
+            observation_shape = flat_observations[0].shape
 
             print("replay_data.observations", replay_data.observations.shape)
-            print("self.batch_size", self.batch_size)
+            print("flat_observations", flat_observations.shape)
+            print("observation_shape", observation_shape)
 
-            encoded_observations = self.policy.encoder(
-                replay_data.observations.view(-1, *replay_data.observations.shape)
-            ).view(self.batch_size, self.batch_length, -1)
+            print("\nself.batch_size, self.sequence_length", self.batch_size, self.sequence_length)
 
+            # encode flat obs and transform [batch_size *sequence_length, features_dim] → [batch_size , sequence_length, features_dim]
+            encoded_observations = self.policy.encoder(flat_observations).view(
+                self.batch_size, self.sequence_length, -1
+            )
             print("encoded_observations", encoded_observations.shape)
+
+            print(" self.policy.recurrent_size", self.policy.recurrent_size)
 
             previous_recurrent_state = th.zeros(self.batch_size, self.policy.recurrent_size, device=self.device)
             print("previous_recurrent_state", previous_recurrent_state.shape)
@@ -381,55 +396,80 @@ class DreamerV3(OffPolicyAlgorithm):
 
             print("replay_data.actions", replay_data.actions.shape)
 
-            for t in range(1, self.batch_length):
-                recurrentState = self.recurrentModel(
+            for t in range(1, self.sequence_length):
+                print("\n t", t)
+
+                recurrent_state = self.policy.recurrent_model(
                     previous_recurrent_state, previous_latent_state, replay_data.actions[:, t - 1]
                 )
-                _, prior_logits = self.priorNet(recurrentState)
-                posterior, posterior_logits = self.posteriorNet(
-                    th.cat((recurrentState, encoded_observations[:, t]), -1)
+                print("recurrent_state", recurrent_state.shape)
+
+                _, prior_logits = self.policy.prior_net(recurrent_state)
+
+                print("prior_logits", prior_logits.shape)
+
+                print("encoded_observations[:, t]", encoded_observations[:, t].shape)
+                print("cat recurrent, encoded ", th.cat((recurrent_state, encoded_observations[:, t]), -1).shape)
+
+                posterior, posterior_logits = self.policy.posterior_net(
+                    th.cat((recurrent_state, encoded_observations[:, t]), -1)
                 )
 
-                recurrent_states_list.append(recurrentState)
+                recurrent_states_list.append(recurrent_state)
                 priors_logits_list.append(prior_logits)
                 posteriors_list.append(posterior)
                 posteriors_logits_list.append(posterior_logits)
 
-                previous_recurrent_state = recurrentState
+                previous_recurrent_state = recurrent_state
                 previous_latent_state = posterior
 
-            recurrent_states_list = th.stack(recurrent_states_list, dim=1)  # (batchSize, batchLength-1, recurrentSize)
+            recurrent_states_list = th.stack(
+                recurrent_states_list, dim=1
+            )  # (batch_size, sequence_length-1, recurrentSize)
+            print("recurrent_states_list", recurrent_states_list.shape)
+
             priors_logits_list = th.stack(
                 priors_logits_list, dim=1
-            )  # (batchSize, batchLength-1, latentLength, latentClasses)
+            )  # (batch_size, sequence_length-1, latent_length, latent_classes)
+            print("priors_logits_list", priors_logits_list.shape)
+
             posteriors_list = th.stack(
                 posteriors_list, dim=1
-            )  # (batchSize, batchLength-1, latentLength*latentClasses)
+            )  # (batch_size, sequence_length-1, latent_length*latent_classes)
+            print("posteriors_list", posteriors_list.shape)
+
             posteriors_logits_list = th.stack(
                 posteriors_logits_list, dim=1
-            )  # (batchSize, batchLength-1, latentLength, latentClasses)
-            fullStates = th.cat(
+            )  # (batch_size, sequence_length-1, latent_length, latent_classes)
+            print("posteriors_logits_list", posteriors_logits_list.shape)
+
+            full_states = th.cat(
                 (recurrent_states_list, posteriors_list), dim=-1
-            )  # (batchSize, batchLength-1, recurrentSize + latentLength*latentClasses)
+            )  # (batch_size, sequence_length-1, recurrentSize + latent_length*latent_classes)
+            print("full_states", full_states.shape)
 
-            reconstructionMeans = self.decoder(fullStates.view(-1, self.fullStateSize)).view(
-                self.config.batchSize, self.config.batchLength - 1, *self.observationShape
+            reconstruction_means = self.policy.decoder(full_states.view(-1, self.policy.full_state_size)).view(
+                self.batch_size, self.sequence_length - 1, *observation_shape
             )
-            reconstructionDistribution = Independent(Normal(reconstructionMeans, 1), len(self.observationShape))
-            reconstructionLoss = -reconstructionDistribution.log_prob(replay_data.observations[:, 1:]).mean()
+            print("reconstruction_means", reconstruction_means.shape)
 
-            rewardDistribution = self.rewardPredictor(fullStates)
-            rewardLoss = -rewardDistribution.log_prob(replay_data.rewards[:, 1:].squeeze(-1)).mean()
+            reconstruction_distribution = Independent(Normal(reconstruction_means, 1), len(observation_shape))
+            reconstruction_loss = -reconstruction_distribution.log_prob(replay_data.observations[:, 1:]).mean()
 
-            priorDistribution = Independent(OneHotCategoricalStraightThrough(logits=priors_logits_list), 1)
-            priorDistributionSG = Independent(OneHotCategoricalStraightThrough(logits=priors_logits_list.detach()), 1)
-            posteriorDistribution = Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits_list), 1)
-            posteriorDistributionSG = Independent(
+            reward_distribution = self.policy.reward_predictor(full_states)
+            reward_loss = -reward_distribution.log_prob(replay_data.rewards[:, 1:].squeeze(-1)).mean()
+
+            prior_distribution = Independent(OneHotCategoricalStraightThrough(logits=priors_logits_list), 1)
+            prior_distribution_SG = Independent(
+                OneHotCategoricalStraightThrough(logits=priors_logits_list.detach()), 1
+            )
+            posterior_distribution = Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits_list), 1)
+            posterior_distribution_SG = Independent(
                 OneHotCategoricalStraightThrough(logits=posteriors_logits_list.detach()), 1
             )
 
-            priorLoss = kl_divergence(posteriorDistributionSG, priorDistribution)
-            posteriorLoss = kl_divergence(posteriorDistribution, priorDistributionSG)
+            priorLoss = kl_divergence(posterior_distribution_SG, prior_distribution)
+            posteriorLoss = kl_divergence(posterior_distribution, prior_distribution_SG)
             freeNats = th.full_like(priorLoss, self.config.freeNats)
 
             priorLoss = self.config.betaPrior * th.maximum(priorLoss, freeNats)
@@ -437,11 +477,11 @@ class DreamerV3(OffPolicyAlgorithm):
             klLoss = (priorLoss + posteriorLoss).mean()
 
             worldModelLoss = (
-                reconstructionLoss + rewardLoss + klLoss
+                reconstruction_loss + reward_loss + klLoss
             )  # I think that the reconstruction loss is relatively a bit too high (11k)
 
             if self.config.useContinuationPrediction:
-                continueDistribution = self.continuePredictor(fullStates)
+                continueDistribution = self.continuePredictor(full_states)
                 continueLoss = th.nn.BCELoss(continueDistribution.probs, 1 - replay_data.dones[:, 1:])
                 worldModelLoss += continueLoss.mean()
 
@@ -455,11 +495,11 @@ class DreamerV3(OffPolicyAlgorithm):
             klLossShiftForGraphing = (self.config.betaPrior + self.config.betaPosterior) * self.config.freeNats
             metrics = {
                 "worldModelLoss": worldModelLoss.item() - klLossShiftForGraphing,
-                "reconstructionLoss": reconstructionLoss.item(),
-                "rewardPredictorLoss": rewardLoss.item(),
+                "reconstruction_loss": reconstruction_loss.item(),
+                "rewardPredictorLoss": reward_loss.item(),
                 "klLoss": klLoss.item() - klLossShiftForGraphing,
             }
-            return fullStates.view(-1, self.fullStateSize).detach(), metrics
+            return full_states.view(-1, self.policy.full_state_size).detach(), metrics
 
             # # =============================================================================
 
