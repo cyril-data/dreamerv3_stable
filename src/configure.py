@@ -4,6 +4,7 @@ import sys
 import gymnasium as gym
 from stable_baselines3 import PPO, DQN, SAC
 from src.utils import inspect_action_space
+from dreamerv3.dreamerv3 import DreamerV3
 from env.nav_2d import Continuous2DNavigationEnv
 from src.loggers import MLflowOutputFormat
 from stable_baselines3.common.logger import HumanOutputFormat, Logger
@@ -20,6 +21,7 @@ from minigrid.manual_control import ManualControl
 import os
 import torch as th
 import mlflow
+from stable_baselines3.common.env_util import make_vec_env
 
 
 def configure_callback(env, args, model_path: str = None):
@@ -82,41 +84,62 @@ def configure_env(args):
     custom_envs = {
         "nav_2d": Continuous2DNavigationEnv,
     }
-    # Create the appropriate environment
+    # arg env
+    env_kwargs = {"render_mode": render_mode}
+    if "hw" in args:
+        env_kwargs["horizontal_walls"] = args.hw
+    if "vw" in args:
+        env_kwargs["vertical_walls"] = args.vw
+    if "bl" in args:
+        env_kwargs["box_low"] = args.bl
+    if "bh" in args:
+        env_kwargs["box_high"] = args.bh
+    if "gp" in args:
+        env_kwargs["goal_pos"] = eval(args.gp)
+    if "al" in args:
+        env_kwargs["action_low"] = -abs(args.al)
+        env_kwargs["action_high"] = abs(args.al)
+    if "ip" in args:
+        if args.ip is not None:
+            env_kwargs["init_pos"] = eval(args.ip)
+
+    # Get number of environments (default to 1 if not specified)
+    n_envs = getattr(args, "nenv", 1)
+
+    # Create vectorized environment
     if env_name in custom_envs:
         env_class = custom_envs[env_name]
-        env_kwarg = {"render_mode": render_mode}
-        if "hw" in args:
-            env_kwarg["horizontal_walls"] = args.hw
-        if "vw" in args:
-            env_kwarg["vertical_walls"] = args.vw
-        if "bl" in args:
-            env_kwarg["box_low"] = args.bl
-        if "bh" in args:
-            env_kwarg["box_high"] = args.bh
-        if "gp" in args:
-            env_kwarg["goal_pos"] = eval(args.gp)
-        if "al" in args:
-            env_kwarg["action_low"] = -abs(args.al)
-            env_kwarg["action_high"] = abs(args.al)
-        if "ip" in args:
-            if args.ip is not None:
-                env_kwarg["init_pos"] = eval(args.ip)
-        env = env_class(**env_kwarg)
+        vec_env = make_vec_env(env_class, n_envs=n_envs, seed=0, env_kwargs=env_kwargs)
     else:
-        env = gym.make(env_name, render_mode=render_mode) if render_mode else gym.make(env_name)
-    inspect_action_space(env)
-    # Enable manual control if specified
-    if "manual" in args and args.manual == True:
-        print("Manual control enabled")
-        manual_control = ManualControl(env, seed=42)
-        manual_control.start()
-    # Parcours de la chaîne des wrappers
-    current_env = env
-    while hasattr(current_env, "env"):
-        print(type(current_env))
-        current_env = current_env.env  # Passe au wrapper interne
-    return env
+        vec_env = make_vec_env(
+            env_name, n_envs=n_envs, seed=0, env_kwargs={"render_mode": render_mode} if render_mode else {}
+        )
+
+    # Note: Manual control and inspection work differently with vectorized envs
+    if n_envs == 1:
+        # For single env, you can still access the underlying env
+        single_env = vec_env.envs[0]
+        inspect_action_space(single_env)
+
+        if "manual" in args and args.manual:
+            print("Manual control enabled")
+            manual_control = ManualControl(single_env, seed=42)
+            manual_control.start()
+    else:
+        # For multiple envs, inspect the first one
+        inspect_action_space(vec_env.envs[0])
+        if "manual" in args and args.manual:
+            print("Warning: Manual control not supported with multiple environments")
+
+    return vec_env
+
+    # # Parcours de la chaîne des wrappers
+    # current_env = env
+    # while hasattr(current_env, "env"):
+    #     print(type(current_env))
+    #     current_env = current_env.env  # Passe au wrapper interne
+
+    # return env
 
 
 def configure_model(env, policy_kwargs, args):
@@ -148,7 +171,7 @@ def configure_model(env, policy_kwargs, args):
                 model_args.pop(key, None)
 
     # Select and instantiate the model
-    model_cls = {"ppo": PPO, "dqn": DQN, "sac": SAC}.get(  # , "dreamer": DreamerV3
+    model_cls = {"ppo": PPO, "dqn": DQN, "sac": SAC, "dreamerv3": DreamerV3}.get(  # , "dreamer": DreamerV3
         alg_name
     )  # , "dqn_feature": DQN_feature
     if model_cls is None:
@@ -219,6 +242,7 @@ def parse_args():
     # Add arguments with défaut value if specified in the YAML
     # env
     add_argument_with_default("--env", None, type=str, help="Name of the environment (e.g., 'MiniGrid-Empty-5x5-v0').")
+    add_argument_with_default("--nenv", None, type=int, help="n_envs")
     add_argument_with_default("--bl", 0.0, type=float, help="env : box_low")
     add_argument_with_default("--bh", 1.0, type=float, help="env : box_high")
     add_boolean_argument_with_default("--manual", False, help="Enable manual control of the environment.")

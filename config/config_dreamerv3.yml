@@ -1,0 +1,25 @@
+env: nav_2d # continuous navigation 2d 
+nenv: 8
+vw:
+  - x: 0.5
+    thickness: 0.02
+    holes:
+      - center: 0.3
+        height: 0.1
+      - center: 0.7
+        height: 0.2
+
+hw:
+  - y: 0.5
+    thickness: 0.02
+    holes:
+      - center: 0.3
+        width: 0.1
+      - center: 0.7
+        width: 0.2
+
+alg: dreamerv3            # type algo : ppo, dqn, sacd or lsfm
+lr: 1.0e-3          # learning rate
+it: !!float 50000   # number of interations
+bs: 10             # batch_size if off policy
+learning_starts: 3000
