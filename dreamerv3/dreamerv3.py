@@ -4,6 +4,7 @@ import numpy as np
 import torch as th
 from gymnasium import spaces
 from torch.nn import functional as F
+import torch.nn as nn
 
 from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.noise import ActionNoise
@@ -132,16 +133,16 @@ class ReplayBufferSequence(ReplayBuffer):
             env,
         )
 
-        # print("batch_sequence", batch_sequence.shape)
-        # print("env_indices", env_indices)
-        # print("next_obs", next_obs.shape)
-        # print("self.observations", self.observations.shape)
-        # print("obs", obs.shape)
-        # print("self.actions", self.actions.shape)
-        # print("actions", actions.shape)
-        # print("batch_inds", batch_inds)
-        # print("dones", dones.shape)
-        # print("reward", rewards.shape)
+        # #print("batch_sequence", batch_sequence.shape)
+        # #print("env_indices", env_indices)
+        # #print("next_obs", next_obs.shape)
+        # #print("self.observations", self.observations.shape)
+        # #print("obs", obs.shape)
+        # #print("self.actions", self.actions.shape)
+        # #print("actions", actions.shape)
+        # #print("batch_inds", batch_inds)
+        # #print("dones", dones.shape)
+        # #print("reward", rewards.shape)
 
         data = (
             obs,
@@ -151,6 +152,26 @@ class ReplayBufferSequence(ReplayBuffer):
             rewards,
         )
         return ReplayBufferSamples(*tuple(map(self.to_torch, data)))
+
+
+class Moments(nn.Module):
+    def __init__(self, device, decay=0.99, min_=1, percentileLow=0.05, percentileHigh=0.95):
+        super().__init__()
+        self._decay = decay
+        self._min = th.tensor(min_)
+        self._percentileLow = percentileLow
+        self._percentileHigh = percentileHigh
+        self.register_buffer("low", th.zeros((), dtype=th.float32, device=device))
+        self.register_buffer("high", th.zeros((), dtype=th.float32, device=device))
+
+    def forward(self, x: th.Tensor) -> tuple[th.Tensor, th.Tensor]:
+        x = x.detach()
+        low = th.quantile(x, self._percentileLow)
+        high = th.quantile(x, self._percentileHigh)
+        self.low = self._decay * self.low + (1 - self._decay) * low
+        self.high = self._decay * self.high + (1 - self._decay) * high
+        inverse_scale = th.max(self._min, self.high - self.low)
+        return self.low.detach(), inverse_scale.detach()
 
 
 class DreamerV3(OffPolicyAlgorithm):
@@ -219,13 +240,14 @@ class DreamerV3(OffPolicyAlgorithm):
     policy: DreamerV3Policy
     actor: Actor
     critic: Critic
-    encoder: MLPEncoder
-    decoder: MLPDecoder
-    recurrentModel: RecurrentModel
-    priorNet: PriorNet
-    posteriorNet: PosteriorNet
-    rewardPredictor: RewardModel
-    continuePredictor: ContinueModel
+    critic_target: Critic
+    # encoder: MLPEncoder
+    # decoder: MLPDecoder
+    # recurrentModel: RecurrentModel
+    # priorNet: PriorNet
+    # posteriorNet: PosteriorNet
+    # rewardPredictor: RewardModel
+    # continuePredictor: ContinueModel
 
     def __init__(
         self,
@@ -237,16 +259,17 @@ class DreamerV3(OffPolicyAlgorithm):
         batch_size: int = 256,
         sequence_length: int = 32,  # sequence_length determines the loop length for recurent state model
         tau: float = 0.005,
-        gamma: float = 0.99,
+        gamma: float = 0.997,
         train_freq: Union[int, tuple[int, str]] = 1,
         gradient_steps: int = 1,
         action_noise: Optional[ActionNoise] = None,
         replay_buffer_class: Optional[type[ReplayBufferSequence]] = ReplayBufferSequence,
         replay_buffer_kwargs: Optional[dict[str, Any]] = None,
         optimize_memory_usage: bool = False,
-        ent_coef: Union[str, float] = "auto",
-        target_update_interval: int = 1,
-        target_entropy: Union[str, float] = "auto",
+        # ent_coef: Union[str, float] = "auto",
+        ent_coef: float = 3.0e-4,
+        # target_update_interval: int = 1,
+        # target_entropy: Union[str, float] = "auto",
         use_sde: bool = False,
         sde_sample_freq: int = -1,
         use_sde_at_warmup: bool = False,
@@ -257,6 +280,14 @@ class DreamerV3(OffPolicyAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
+        free_nats: float = 1.0,
+        beta_prior: float = 1.0,
+        beta_posterior: float = 0.1,
+        use_continuation_prediction: bool = True,
+        gradient_clip: float = 100,
+        gradient_norm_type: int = 2,
+        imagination_horizon: int = 16,
+        gae_lambda: float = 0.95,
     ):
         super().__init__(
             policy,
@@ -287,16 +318,27 @@ class DreamerV3(OffPolicyAlgorithm):
         )
 
         self.sequence_length = sequence_length
-        self.target_entropy = target_entropy
-        self.log_ent_coef = None  # type: Optional[th.Tensor]
+        # self.target_entropy = target_entropy
+        # self.log_ent_coef = None  # type: Optional[th.Tensor]
         # Entropy coefficient / Entropy temperature
         # Inverse of the reward scale
         self.ent_coef = ent_coef
-        self.target_update_interval = target_update_interval
-        self.ent_coef_optimizer: Optional[th.optim.Adam] = None
+        # self.target_update_interval = target_update_interval
+        # self.ent_coef_optimizer: Optional[th.optim.Adam] = None
+        self.free_nats = free_nats
+        self.beta_prior = beta_prior
+        self.beta_posterior = beta_posterior
+        self.use_continuation_prediction = use_continuation_prediction
+        self.gradient_clip = gradient_clip
+        self.gradient_norm_type = gradient_norm_type
+        self.imagination_horizon = imagination_horizon
+        self.gae_lambda = gae_lambda
+        self.value_moments = Moments(self.device)
 
         if _init_setup_model:
             self._setup_model()
+
+        print("DreamerV3 policy :", self.policy)
 
     def _setup_model(self) -> None:
         super()._setup_model()
@@ -304,34 +346,35 @@ class DreamerV3(OffPolicyAlgorithm):
         # Running mean and running var
         self.batch_norm_stats = get_parameters_by_name(self.critic, ["running_"])
         self.batch_norm_stats_target = get_parameters_by_name(self.critic_target, ["running_"])
-        # Target entropy is used when learning the entropy coefficient
-        if self.target_entropy == "auto":
-            # automatically set target entropy if needed
-            self.target_entropy = float(-np.prod(self.env.action_space.shape).astype(np.float32))  # type: ignore
-        else:
-            # Force conversion
-            # this will also throw an error for unexpected string
-            self.target_entropy = float(self.target_entropy)
+        # # Target entropy is used when learning the entropy coefficient
+        # if self.target_entropy == "auto":
+        #     # automatically set target entropy if needed
+        #     self.target_entropy = float(-np.prod(self.env.action_space.shape).astype(np.float32))  # type: ignore
+        # else:
+        #     # Force conversion
+        #     # this will also throw an error for unexpected string
+        #     self.target_entropy = float(self.target_entropy)
 
         # The entropy coefficient or entropy can be learned automatically
         # see Automating Entropy Adjustment for Maximum Entropy RL section
         # of https://arxiv.org/abs/1812.05905
-        if isinstance(self.ent_coef, str) and self.ent_coef.startswith("auto"):
-            # Default initial value of ent_coef when learned
-            init_value = 1.0
-            if "_" in self.ent_coef:
-                init_value = float(self.ent_coef.split("_")[1])
-                assert init_value > 0.0, "The initial value of ent_coef must be greater than 0"
+        # if isinstance(self.ent_coef, str) and self.ent_coef.startswith("auto"):
+        #     # Default initial value of ent_coef when learned
+        #     init_value = 1.0
+        #     if "_" in self.ent_coef:
+        #         init_value = float(self.ent_coef.split("_")[1])
+        #         assert init_value > 0.0, "The initial value of ent_coef must be greater than 0"
 
-            # Note: we optimize the log of the entropy coeff which is slightly different from the paper
-            # as discussed in https://github.com/rail-berkeley/softlearning/issues/37
-            self.log_ent_coef = th.log(th.ones(1, device=self.device) * init_value).requires_grad_(True)
-            self.ent_coef_optimizer = th.optim.Adam([self.log_ent_coef], lr=self.lr_schedule(1))
-        else:
-            # Force conversion to float
-            # this will throw an error if a malformed string (different from 'auto')
-            # is passed
-            self.ent_coef_tensor = th.tensor(float(self.ent_coef), device=self.device)
+        #     # Note: we optimize the log of the entropy coeff which is slightly different from the paper
+        #     # as discussed in https://github.com/rail-berkeley/softlearning/issues/37
+        #     self.log_ent_coef = th.log(th.ones(1, device=self.device) * init_value).requires_grad_(True)
+        #     self.ent_coef_optimizer = th.optim.Adam([self.log_ent_coef], lr=self.lr_schedule(1))
+        # else:
+        # Force conversion to float
+        # this will throw an error if a malformed string (different from 'auto')
+        # is passed
+
+        self.ent_coef_tensor = th.tensor(float(self.ent_coef), device=self.device)
 
     def _create_aliases(self) -> None:
         self.actor = self.policy.actor
@@ -343,74 +386,59 @@ class DreamerV3(OffPolicyAlgorithm):
         self.policy.set_training_mode(True)
         # Update optimizers learning rate
         optimizers = [self.actor.optimizer, self.critic.optimizer, self.policy.world_model_optimizer]
-        if self.ent_coef_optimizer is not None:
-            optimizers += [self.ent_coef_optimizer]
+        # if self.ent_coef_optimizer is not None:
+        #     optimizers += [self.ent_coef_optimizer]
 
         # Update learning rate according to lr schedule
         self._update_learning_rate(optimizers)
 
-        ent_coef_losses, ent_coefs = [], []
-        actor_losses, critic_losses = [], []
+        # ent_coef_losses, ent_coefs = [], []
+        actor_loss_list, critic_loss_list = [], []
+
+        world_model_loss_list, reconstruction_loss_list, reward_loss_list, kl_loss_list = [], [], [], []
 
         for gradient_step in range(gradient_steps):
-            # Sample replay buffer
+
+            # ==================================================================
+            # ==================================================================
+            # Off-policy Model based training with sequences
+            # ==================================================================
+            # ==================================================================
+
+            # *** Sample replay buffer
             replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env, sequence_length=self.sequence_length)  # type: ignore[union-attr]
 
-            # We need to sample because `log_std` may have changed between two gradient steps
+            # *** We need to sample because `log_std` may have changed between two gradient steps
             if self.use_sde:
                 self.actor.reset_noise()
 
-            # =============================================================================
-            # --- World model training
-            print("*" * 80)
-            print("*" * 80)
-            print("World model training")
-            print("*" * 80)
-            print("*" * 80)
-
-            # Transform [batch_size, sequence_length, obs.shape] → [batch_size * sequence_length, obs_shape]
+            # *** Transform [batch_size, sequence_length, obs.shape] → [batch_size * sequence_length, obs_shape]
             flat_observations = replay_data.observations.view(-1, 2)
 
             observation_shape = flat_observations[0].shape
 
-            print("replay_data.observations", replay_data.observations.shape)
-            print("flat_observations", flat_observations.shape)
-            print("observation_shape", observation_shape)
-
-            print("\nself.batch_size, self.sequence_length", self.batch_size, self.sequence_length)
-
-            # encode flat obs and transform [batch_size *sequence_length, features_dim] → [batch_size , sequence_length, features_dim]
+            # *** encode flat obs and transform [batch_size *sequence_length, features_dim] → [batch_size , sequence_length, features_dim]
             encoded_observations = self.policy.encoder(flat_observations).view(
                 self.batch_size, self.sequence_length, -1
             )
-            print("encoded_observations", encoded_observations.shape)
 
-            print(" self.policy.recurrent_size", self.policy.recurrent_size)
-
+            # *** init previous recurrent_state and discrete_latent_state
             previous_recurrent_state = th.zeros(self.batch_size, self.policy.recurrent_size, device=self.device)
-            print("previous_recurrent_state", previous_recurrent_state.shape)
-            previous_latent_state = th.zeros(self.batch_size, self.policy.latent_size, device=self.device)
-            print("previous_latent_state", previous_recurrent_state.shape)
+            previous_discrete_latent_state = th.zeros(self.batch_size, self.policy.latent_size, device=self.device)
 
             recurrent_states_list, priors_logits_list, posteriors_list, posteriors_logits_list = [], [], [], []
 
-            print("replay_data.actions", replay_data.actions.shape)
-
+            # *** loop in the sequence to get all recurrent states and prior/posterior discrete latent states
             for t in range(1, self.sequence_length):
-                print("\n t", t)
 
                 recurrent_state = self.policy.recurrent_model(
-                    previous_recurrent_state, previous_latent_state, replay_data.actions[:, t - 1]
+                    previous_recurrent_state, previous_discrete_latent_state, replay_data.actions[:, t - 1]
                 )
-                print("recurrent_state", recurrent_state.shape)
-
+                # *** prior     output is a *discrete latent state*, which only comes from *recurrent_state* (but logits are contineous).
                 _, prior_logits = self.policy.prior_net(recurrent_state)
 
-                print("prior_logits", prior_logits.shape)
-
-                print("encoded_observations[:, t]", encoded_observations[:, t].shape)
-                print("cat recurrent, encoded ", th.cat((recurrent_state, encoded_observations[:, t]), -1).shape)
-
+                # *** posterior output is a discrete latent state*, which comes from *both recurrent_state AND encoded_observations*
+                # *** posterior is more relyable because it contains encoded_observations in addition
                 posterior, posterior_logits = self.policy.posterior_net(
                     th.cat((recurrent_state, encoded_observations[:, t]), -1)
                 )
@@ -420,45 +448,43 @@ class DreamerV3(OffPolicyAlgorithm):
                 posteriors_list.append(posterior)
                 posteriors_logits_list.append(posterior_logits)
 
+                # *** update the states for next discrete_latent_state and recurrent_state
                 previous_recurrent_state = recurrent_state
-                previous_latent_state = posterior
+                previous_discrete_latent_state = posterior
 
-            recurrent_states_list = th.stack(
-                recurrent_states_list, dim=1
-            )  # (batch_size, sequence_length-1, recurrentSize)
-            print("recurrent_states_list", recurrent_states_list.shape)
+            # *** stack recurrent and prior/posterior discrete latent states
+            recurrent_states_list = th.stack(recurrent_states_list, dim=1)
+            # (batch_size, sequence_length-1, recurrentSize)
+            priors_logits_list = th.stack(priors_logits_list, dim=1)
+            # (batch_size, sequence_length-1, latent_length, latent_classes)
+            posteriors_list = th.stack(posteriors_list, dim=1)
+            # (batch_size, sequence_length-1, latent_length*latent_classes)
+            posteriors_logits_list = th.stack(posteriors_logits_list, dim=1)
+            # (batch_size, sequence_length-1, latent_length, latent_classes)
 
-            priors_logits_list = th.stack(
-                priors_logits_list, dim=1
-            )  # (batch_size, sequence_length-1, latent_length, latent_classes)
-            print("priors_logits_list", priors_logits_list.shape)
+            # *** cat recurrent_states and posteriors discrete latent states
+            full_state = th.cat((recurrent_states_list, posteriors_list), dim=-1)
+            # (batch_size, sequence_length-1, recurrentSize + latent_length*latent_classes)
 
-            posteriors_list = th.stack(
-                posteriors_list, dim=1
-            )  # (batch_size, sequence_length-1, latent_length*latent_classes)
-            print("posteriors_list", posteriors_list.shape)
-
-            posteriors_logits_list = th.stack(
-                posteriors_logits_list, dim=1
-            )  # (batch_size, sequence_length-1, latent_length, latent_classes)
-            print("posteriors_logits_list", posteriors_logits_list.shape)
-
-            full_states = th.cat(
-                (recurrent_states_list, posteriors_list), dim=-1
-            )  # (batch_size, sequence_length-1, recurrentSize + latent_length*latent_classes)
-            print("full_states", full_states.shape)
-
-            reconstruction_means = self.policy.decoder(full_states.view(-1, self.policy.full_state_size)).view(
+            # *** decode the MEAN of full_state into *original observation* into reconstruction_means
+            reconstruction_means = self.policy.decoder(full_state.view(-1, self.policy.full_state_size)).view(
                 self.batch_size, self.sequence_length - 1, *observation_shape
             )
-            print("reconstruction_means", reconstruction_means.shape)
-
+            # *** impose a non learning variance = 1 for reconstruction_distribution.
+            # *** Independent is necessarry to replace *n* Normal distributions 1D into *1* multivariate Normal distributions
+            #     with *n* independants components.
+            # *** reconstruction_loss is the *neg log_prob* for minimum optimisation
             reconstruction_distribution = Independent(Normal(reconstruction_means, 1), len(observation_shape))
             reconstruction_loss = -reconstruction_distribution.log_prob(replay_data.observations[:, 1:]).mean()
 
-            reward_distribution = self.policy.reward_predictor(full_states)
+            # *** RewardModel returns directly a distrib with mean AND variance trainable.
+            # *** reward_loss is the *neg log_prob* for minimum optimisation
+            reward_distribution = self.policy.reward_predictor(full_state)
             reward_loss = -reward_distribution.log_prob(replay_data.rewards[:, 1:].squeeze(-1)).mean()
 
+            # *** OneHotCategoricalStraightThrough forward : transform logits into OneHot vectors for discrete latent states
+            # *** OneHotCategoricalStraightThrough backward is differentiable softmax
+            # *** Stop Gradient (SG) is needed to calcule kl divergence from a frozen distrib. Each distrib is alternatively frozen
             prior_distribution = Independent(OneHotCategoricalStraightThrough(logits=priors_logits_list), 1)
             prior_distribution_SG = Independent(
                 OneHotCategoricalStraightThrough(logits=priors_logits_list.detach()), 1
@@ -468,38 +494,157 @@ class DreamerV3(OffPolicyAlgorithm):
                 OneHotCategoricalStraightThrough(logits=posteriors_logits_list.detach()), 1
             )
 
-            priorLoss = kl_divergence(posterior_distribution_SG, prior_distribution)
-            posteriorLoss = kl_divergence(posterior_distribution, prior_distribution_SG)
-            freeNats = th.full_like(priorLoss, self.config.freeNats)
+            prior_loss = kl_divergence(posterior_distribution_SG, prior_distribution)
+            posterior_loss = kl_divergence(posterior_distribution, prior_distribution_SG)
+            # *** Map the free_nats coef to prior_loss shape
+            free_nats = th.full_like(prior_loss, self.free_nats)
 
-            priorLoss = self.config.betaPrior * th.maximum(priorLoss, freeNats)
-            posteriorLoss = self.config.betaPosterior * th.maximum(posteriorLoss, freeNats)
-            klLoss = (priorLoss + posteriorLoss).mean()
+            # *** scaled prior loss > beta_posterior : prior distrib must learn more because less informed (lack of encoded state)
+            # *** training is stopped if kl prior ou posterior loss is too high
+            prior_loss = self.beta_prior * th.maximum(prior_loss, free_nats)
+            posterior_loss = self.beta_posterior * th.maximum(posterior_loss, free_nats)
+            kl_loss = (prior_loss + posterior_loss).mean()
 
-            worldModelLoss = (
-                reconstruction_loss + reward_loss + klLoss
-            )  # I think that the reconstruction loss is relatively a bit too high (11k)
+            world_model_loss = reconstruction_loss + reward_loss + kl_loss
 
-            if self.config.useContinuationPrediction:
-                continueDistribution = self.continuePredictor(full_states)
-                continueLoss = th.nn.BCELoss(continueDistribution.probs, 1 - replay_data.dones[:, 1:])
-                worldModelLoss += continueLoss.mean()
+            if self.use_continuation_prediction:
+                # *** continue_predictor ouputs a Bernoulli distribution, because target is True or False
+                # *** continue_loss is the Binary Cross Entropy with the dones as target
+                continue_distribution = self.policy.continue_predictor(full_state)
+                continue_probs = continue_distribution.probs.squeeze(-1)
+                dones_target = (1 - replay_data.dones[:, 1:]).squeeze(-1)
+                criterion = th.nn.BCELoss()
+                continue_loss = criterion(continue_probs, dones_target)
+                world_model_loss += continue_loss.mean()
 
-            self.worldModelOptimizer.zero_grad()
-            worldModelLoss.backward()
+            # *** training with clip gradients:
+            self.policy.world_model_optimizer.zero_grad()
+            world_model_loss.backward()
             th.nn.utils.clip_grad_norm_(
-                self.worldModelParameters, self.config.gradientClip, norm_type=self.config.gradientNormType
+                self.policy.world_model_parameters, self.gradient_clip, norm_type=self.gradient_norm_type
             )
-            self.worldModelOptimizer.step()
+            self.policy.world_model_optimizer.step()
 
-            klLossShiftForGraphing = (self.config.betaPrior + self.config.betaPosterior) * self.config.freeNats
-            metrics = {
-                "worldModelLoss": worldModelLoss.item() - klLossShiftForGraphing,
-                "reconstruction_loss": reconstruction_loss.item(),
-                "rewardPredictorLoss": reward_loss.item(),
-                "klLoss": klLoss.item() - klLossShiftForGraphing,
-            }
-            return full_states.view(-1, self.policy.full_state_size).detach(), metrics
+            # *** append losses for control
+            kl_loss_shift_for_graphing = (self.beta_prior + self.beta_posterior) * self.free_nats
+            world_model_loss_list.append(world_model_loss.item() - kl_loss_shift_for_graphing)
+            reconstruction_loss_list.append(reconstruction_loss.item())
+            reward_loss_list.append(reward_loss.item())
+            kl_loss_list.append(kl_loss.item() - kl_loss_shift_for_graphing)
+
+            # ==================================================================
+            # ==================================================================
+            # Policy training with imagination trajectories based from the model
+            # ==================================================================
+            # ==================================================================
+
+            #                                   *****
+            # For imagination trajectories, we start with all states of sequences and use prior
+            # to imagine trajectories from these states as initial state for each trajectories
+            # that's why we flat sequences (.view ) into individuals states.
+            #                                   *****
+
+            full_state = full_state.view(-1, self.policy.full_state_size).detach()
+            # (batch_size * (sequence_length-1), recurrentSize + latent_length*latent_classes)
+
+            # *** separate recurrent_state and discrete_latent_state from full_state
+            recurrent_state, discrete_latent_state = th.split(
+                full_state, (self.policy.recurrent_size, self.policy.latent_size), -1
+            )
+            # recurrent_state (batch_size * (sequence_length-1), recurrentSize)
+            # discrete_latent_state (batch_size * (sequence_length-1), latent_length*latent_classes)
+
+            full_states_list, log_probs_list, entropies_list = [], [], []
+
+            # *** Rollout imagination transitions with prior_net from all states in the sequences
+            # *** => storage of full_state, and log_prob/entropy actor list
+            for _ in range(self.imagination_horizon):
+                action, logprob = self.actor.action_log_prob(full_state.detach())
+                entropy = -logprob
+
+                recurrent_state = self.policy.recurrent_model(recurrent_state, discrete_latent_state, action)
+                # *** discrete_latent_state is overwritten by the new discrete_latent_state
+                discrete_latent_state, _ = self.policy.prior_net(recurrent_state)
+
+                # *** full_state is overwritten by the new recurrent_state and discrete_latent_state
+                full_state = th.cat((recurrent_state, discrete_latent_state), -1)
+
+                # full_state log_prob and entropy actor list storage
+                full_states_list.append(full_state)
+                log_probs_list.append(logprob)
+                entropies_list.append(entropy)
+
+            full_states_sequences = th.stack(full_states_list, dim=1)
+            # (batchSize*batchLength, imagination_horizon, recurrentSize + latent_length*latent_classes)
+
+            log_probs_list = th.stack(log_probs_list[1:], dim=1)  # (batchSize*batchLength, imagination_horizon-1)
+            entropies_list = th.stack(entropies_list[1:], dim=1)  # (batchSize*batchLength, imagination_horizon-1)
+
+            predicted_rewards = self.policy.reward_predictor(full_states_sequences[:, :-1]).mean
+
+            # *** Critic returns a Normal distribution with mean and variance trainable
+            values = self.critic(full_states_sequences).mean
+
+            # *** predict the dones. = self.gamma if not use_continuation_prediction
+            continues = (
+                self.policy.continue_predictor(full_states_sequences).mean.squeeze(-1)
+                if self.use_continuation_prediction
+                else th.full_like(predicted_rewards, self.gamma)
+            )
+
+            lambda_values = self.compute_lambda_values(predicted_rewards, values, continues, self.gae_lambda)
+
+            # TODO : test lambda_values_bis if it IMPROVES RESULTS
+            # lambda_values_bis = self.compute_lambda_values_bis(predicted_rewards, values, continues, self.gae_lambda)
+            # print("lambda_values", lambda_values)
+            # print("lambda_values_bis", lambda_values_bis)
+            # print("lambda_values - lambda_values_bis", lambda_values - lambda_values_bis)
+
+            _, inverse_scale = self.value_moments(lambda_values)
+            # *** inverse_scale = max ( Per95(Return) - Per05(Return) )
+            # with Exponential Moving Average (EMA) for perceptiles : EMAₜ = β · EMAₜ₋₁ + (1 - β) · xₜ
+            #     => scalar ~= max(Return) - min(return)
+
+            advantages = (lambda_values - values[:, :-1]) / inverse_scale
+            # *** advantages is not simply A = returns - values[:, :-1] but A is normalize by inverse_scale
+
+            actor_loss = -th.mean(advantages.detach() * log_probs_list + self.ent_coef * entropies_list)
+            # *** advantages is not simply A = returns - values[:, :-1] but A is normalize by inverse_scale
+
+            self.actor.optimizer.zero_grad()
+            actor_loss.backward()
+            nn.utils.clip_grad_norm_(self.actor.parameters(), self.gradient_clip, norm_type=self.gradient_norm_type)
+            self.actor.optimizer.step()
+            actor_loss_list.append(actor_loss.item())
+
+            # *********************************************
+            # *** critic loss ***
+            # Categorical distribution with exponentially spaced bins     IS MISSING !!!
+            # -------------------------------------------------------     ==========
+            #
+            # This part below with both imagination and replay trajectory IS MISSING !!!
+            # ----------------------------------------------------------- ==========
+            #
+            # To improve value prediction in environments where rewards are challenging
+            # to predict, we apply the critic loss both to imagined trajectories with
+            # loss scale βval = 1 and to trajectories sampled from the replay buffer
+            # with loss scale βrepval = 0.3. The critic replay loss uses the imagination
+            # returns Rλ  t at the start states of the imagination rollouts as on-policy
+            #  value annotations for the replay trajectory to then compute λ-returns over
+            # the replay rewards.
+            # *********************************************
+
+            value_distributions = self.critic(full_states_sequences[:, :-1].detach())
+            critic_loss = -th.mean(value_distributions.log_prob(lambda_values.detach()))
+            # *** estimates V using the maximum likelihood loss with target = return beyond the prediction horizon
+
+            self.critic.optimizer.zero_grad()
+            critic_loss.backward()
+            nn.utils.clip_grad_norm_(self.critic.parameters(), self.gradient_clip, norm_type=self.gradient_norm_type)
+            self.critic.optimizer.step()
+            critic_loss_list.append(critic_loss.item())
+
+            # return full_states.view(-1, self.policy.full_state_size).detach(), metrics
 
             # # =============================================================================
 
@@ -549,7 +694,7 @@ class DreamerV3(OffPolicyAlgorithm):
             # # Compute critic loss
             # critic_loss = 0.5 * sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
             # assert isinstance(critic_loss, th.Tensor)  # for type checker
-            # critic_losses.append(critic_loss.item())  # type: ignore[union-attr]
+            # critic_loss_list.append(critic_loss.item())  # type: ignore[union-attr]
 
             # # Optimize the critic
             # self.critic.optimizer.zero_grad()
@@ -562,7 +707,7 @@ class DreamerV3(OffPolicyAlgorithm):
             # q_values_pi = th.cat(self.critic(replay_data.observations, actions_pi), dim=1)
             # min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
             # actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
-            # actor_losses.append(actor_loss.item())
+            # actor_loss_list.append(actor_loss.item())
 
             # # Optimize the actor
             # self.actor.optimizer.zero_grad()
@@ -578,11 +723,37 @@ class DreamerV3(OffPolicyAlgorithm):
         self._n_updates += gradient_steps
 
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
-        self.logger.record("train/ent_coef", np.mean(ent_coefs))
-        self.logger.record("train/actor_loss", np.mean(actor_losses))
-        self.logger.record("train/critic_loss", np.mean(critic_losses))
-        if len(ent_coef_losses) > 0:
-            self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
+        # self.logger.record("train/ent_coef", np.mean(ent_coefs))
+
+        self.logger.record("train/world_model_loss", np.mean(world_model_loss_list))
+        self.logger.record("train/world_reconstruction_loss", np.mean(reconstruction_loss_list))
+        self.logger.record("train/world_reward_loss", np.mean(reward_loss_list))
+        self.logger.record("train/world_kl_loss", np.mean(kl_loss_list))
+
+        self.logger.record("train/actor_loss", np.mean(actor_loss_list))
+        self.logger.record("train/critic_loss", np.mean(critic_loss_list))
+        # self.logger.record("train/actor_loss", np.mean(actor_loss_list))
+        # self.logger.record("train/critic_loss", np.mean(critic_loss_list))
+        # if len(ent_coef_losses) > 0:
+        #     self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
+
+    def compute_lambda_values(self, rewards, values, continues, lambda_=0.95):
+        returns = th.zeros_like(rewards)
+        bootstrap = values[:, -1]
+        for i in reversed(range(rewards.shape[-1])):
+            returns[:, i] = rewards[:, i] + continues[:, i] * ((1 - lambda_) * values[:, i] + lambda_ * bootstrap)
+            bootstrap = returns[:, i]
+        return returns
+
+    def compute_lambda_values_bis(self, rewards, values, continues, lambda_=0.95):
+        advantages = th.zeros_like(rewards)
+        last_gae_lam = 0
+        for step in reversed(range(rewards.shape[-1])):
+            delta = rewards[:, step] + self.gamma * values[:, step + 1] * continues[:, step + 1] - values[:, step]
+            last_gae_lam = delta + self.gamma * lambda_ * continues[:, step + 1] * last_gae_lam
+            advantages[:, step] = last_gae_lam
+        returns = advantages + values[:, :-1]
+        return returns
 
     def tranform_obs_to_tensor(self, observation):
         # Switch to eval mode (this affects batch norm / dropout)
@@ -662,13 +833,13 @@ class DreamerV3(OffPolicyAlgorithm):
             last_observations, vectorized_env = self.tranform_obs_to_tensor(self._last_obs)
             with th.no_grad():
                 self.recurrent_states = self.policy.recurrent_model(
-                    self.recurrent_states, self.latent_states, self.last_buffer_actions
+                    self.recurrent_states, self.discrete_latent_states, self.last_buffer_actions
                 )
                 encoded_last_obs = self.policy.encoder(last_observations)
-                self.latent_states, _ = self.policy.posterior_net(
+                self.discrete_latent_states, _ = self.policy.posterior_net(
                     th.cat((self.recurrent_states, encoded_last_obs), dim=1)
                 )
-                actions = self.policy._predict(self.recurrent_states, self.latent_states, deterministic=False)
+                actions = self.policy._predict(self.recurrent_states, self.discrete_latent_states, deterministic=False)
             unscaled_action = self.tranform_action_to_np(actions, vectorized_env)
 
             # *****************************************************************************
@@ -799,7 +970,7 @@ class DreamerV3(OffPolicyAlgorithm):
 
                     # =============================================================================
                     # *****************************************************************************
-                    # Need to init recurrent_states, latent_states, last_buffer_actions
+                    # Need to init recurrent_states, discrete_latent_states, last_buffer_actions
                     self.init_recurents_latents_actions(idx)
                     # *****************************************************************************
                     # =============================================================================
@@ -811,13 +982,13 @@ class DreamerV3(OffPolicyAlgorithm):
     def init_recurents_latents_actions(self, env_num=None):
 
         if env_num is None:
-            self.recurrent_states, self.latent_states = th.zeros(
+            self.recurrent_states, self.discrete_latent_states = th.zeros(
                 self.n_envs, self.policy.recurrent_size, device=self.device
             ), th.zeros(self.n_envs, self.policy.latent_size, device=self.device)
             self.last_buffer_actions = th.zeros(self.n_envs, self.policy.action_dim).to(self.device)
         else:
             self.recurrent_states[env_num] = 0
-            self.latent_states[env_num] = 0
+            self.discrete_latent_states[env_num] = 0
             self.last_buffer_actions[env_num] = 0
 
     def learn(
@@ -846,9 +1017,9 @@ class DreamerV3(OffPolicyAlgorithm):
 
     def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
         state_dicts = ["policy", "actor.optimizer", "critic.optimizer"]
-        if self.ent_coef_optimizer is not None:
-            saved_pytorch_variables = ["log_ent_coef"]
-            state_dicts.append("ent_coef_optimizer")
-        else:
-            saved_pytorch_variables = ["ent_coef_tensor"]
-        return state_dicts, saved_pytorch_variables
+        # if self.ent_coef_optimizer is not None:
+        #     saved_pytorch_variables = ["log_ent_coef"]
+        #     state_dicts.append("ent_coef_optimizer")
+        # else:
+        # saved_pytorch_variables = ["ent_coef_tensor"]
+        return state_dicts, []

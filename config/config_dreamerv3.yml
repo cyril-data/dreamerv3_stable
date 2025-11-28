@@ -1,5 +1,5 @@
 env: nav_2d # continuous navigation 2d 
-nenv: 8
+nenv: 1
 vw:
   - x: 0.5
     thickness: 0.02
@@ -21,5 +21,59 @@ hw:
 alg: dreamerv3            # type algo : ppo, dqn, sacd or lsfm
 lr: 1.0e-3          # learning rate
 it: !!float 50000   # number of interations
-bs: 10             # batch_size if off policy
+bs: 300             # batch_size if off policy
 learning_starts: 3000
+
+actor:
+# ***************************************************
+# ***************************************************
+# RANDOM ACTION !!!
+  random: false
+# ***************************************************
+# ***************************************************
+  # net_arch: [400, 400]
+  net_arch: 
+  - 40
+  - 40
+
+critic:
+  # net_arch: [400, 400, 400]
+  net_arch: 
+    - 40
+    - 40
+    - 40
+
+
+
+latent_classes: 16
+latent_length:  16
+# recurrent_size:  512
+recurrent_size:  32
+
+recurrent_model:
+  # hidden_size: 200
+  hidden_size: 20
+
+prior_net:
+  # net_arch: [200]
+  net_arch: 
+  - 20
+  uniform_mix: 0.01
+
+posterior_net:
+  # net_arch: [200]
+  net_arch: 
+  - 20
+  uniform_mix: 0.01
+
+reward_net:
+  # net_arch: [400, 400]
+  net_arch: 
+  - 40
+  - 40
+
+continue_net:
+  # net_arch: [400, 400, 400]
+  net_arch: 
+    - 40
+    - 40

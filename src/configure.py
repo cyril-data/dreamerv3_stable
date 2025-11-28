@@ -63,6 +63,28 @@ def configure_policy(args, env):
         "normalize_images": False,
         "net_arch": eval(args.na),
     }
+    if args.alg == "dreamerv3":
+        if "latent_classes" in args:
+            policy_kwargs["latent_classes"] = args.latent_classes
+        if "recurrent_size" in args:
+            policy_kwargs["recurrent_size"] = args.recurrent_size
+        if "latent_length" in args:
+            policy_kwargs["latent_length"] = args.latent_length
+        if "recurrent_model" in args:
+            policy_kwargs["recurrent_model_kwargs"] = args.recurrent_model
+        if "prior_net" in args:
+            policy_kwargs["prior_net_kwargs"] = args.prior_net
+        if "posterior_net" in args:
+            policy_kwargs["posterior_net_kwargs"] = args.posterior_net
+        if "reward_net" in args:
+            policy_kwargs["reward_net_kwargs"] = args.reward_net
+        if "continue_net" in args:
+            policy_kwargs["continue_net_kwargs"] = args.continue_net
+        if "actor" in args:
+            policy_kwargs["actor_kwargs"] = args.actor
+        if "critic" in args:
+            policy_kwargs["critic_kwargs"] = args.critic
+
     return policy_kwargs
 
 
@@ -130,6 +152,8 @@ def configure_env(args):
         inspect_action_space(vec_env.envs[0])
         if "manual" in args and args.manual:
             print("Warning: Manual control not supported with multiple environments")
+
+    print("env_kwargs", env_kwargs)
 
     return vec_env
 
@@ -249,6 +273,8 @@ def parse_args():
     add_argument_with_default("--gp", "[0.9,0.9]", type=str, help="goal_pos.")
     add_argument_with_default("--al", 0.03, type=float, help="action limit")
     add_argument_with_default("--ip", None, type=str, help="initial position. random if None")
+    add_argument_with_default("--vw", None, help="vertical_walls ")
+    add_argument_with_default("--hw", None, help="horizontal_walls  ")
 
     # alg
     add_argument_with_default(
@@ -264,6 +290,16 @@ def parse_args():
     add_argument_with_default("--xp", None, type=str, help="experience name")
     add_argument_with_default("--run", None, type=str, help="run name")
     add_argument_with_default("--ga", None, type=float, help="gamma (e.g., 0.99).")
+    add_argument_with_default("--latent_classes", None, help="latent_classes")
+    add_argument_with_default("--latent_length", None, help="latent_length")
+    add_argument_with_default("--recurrent_size", None, help="recurrent_size")
+    add_argument_with_default("--recurrent_model", None, help="recurrent_model")
+    add_argument_with_default("--prior_net", None, help="prior_net")
+    add_argument_with_default("--posterior_net", None, help="posterior_net")
+    add_argument_with_default("--reward_net", None, help="reward_net")
+    add_argument_with_default("--continue_net", None, help="continue_net")
+    add_argument_with_default("--actor", None, help="actor")
+    add_argument_with_default("--critic", None, help="critic")
 
     # joined = "_" + "_".join([f"{k.lstrip('-')}{v}" for k, v in zip(remaining_argv[::2], remaining_argv[1::2])])
     joined = "_" + "_".join(

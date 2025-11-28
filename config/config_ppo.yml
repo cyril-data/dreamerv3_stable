@@ -1,4 +1,5 @@
-env: nav_2d         # continuous navigation 2d 
+env: nav_2d # continuous navigation 2d 
+nenv: 8
 vw:
   - x: 0.5
     thickness: 0.02

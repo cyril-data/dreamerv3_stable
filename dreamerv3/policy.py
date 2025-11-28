@@ -116,6 +116,7 @@ class Actor(nn.Module):
         full_std: bool = True,
         use_expln: bool = False,
         clip_mean: float = 2.0,
+        random: bool = True,
     ):
         super().__init__()
 
@@ -130,6 +131,7 @@ class Actor(nn.Module):
         self.use_expln = use_expln
         self.full_std = full_std
         self.clip_mean = clip_mean
+        self.random = random
 
         action_dim = get_action_dim(self.action_space)
         latent_pi_net = create_mlp(features_dim, -1, net_arch, activation_fn=activation_fn)
@@ -212,6 +214,8 @@ class Actor(nn.Module):
         # Original Implementation to cap the standard deviation
         log_std = LOG_STD_MIN + (LOG_STD_MAX - LOG_STD_MIN) / 2 * (th.tanh(log_std) + 1)  # (-1, 1) to (min, max)
         # log_std = th.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        if self.random:
+            log_std = th.tensor(LOG_STD_MAX)
         return mean_actions, log_std, {}
 
     def forward(self, features: th.Tensor, deterministic: bool = False) -> th.Tensor:
@@ -220,6 +224,11 @@ class Actor(nn.Module):
         return self.action_dist.actions_from_params(mean_actions, log_std, deterministic=deterministic, **kwargs)
 
     def action_log_prob(self, features: th.Tensor) -> tuple[th.Tensor, th.Tensor]:
+        mean_actions, log_std, kwargs = self.get_action_dist_params(features)
+        # return action and associated log prob
+        return self.action_dist.log_prob_from_params(mean_actions, log_std, **kwargs)
+
+    def entropy(self, features: th.Tensor) -> tuple[th.Tensor, th.Tensor]:
         mean_actions, log_std, kwargs = self.get_action_dist_params(features)
         # return action and associated log prob
         return self.action_dist.log_prob_from_params(mean_actions, log_std, **kwargs)
@@ -301,18 +310,18 @@ class RecurrentModel(nn.Module):
         self.recurrent = nn.GRUCell(hidden_size, recurrent_size)
 
     def forward(self, recurrent_state, latent_state, action):
-        print("recurrent_state", recurrent_state.shape)
-        print("latent_state", latent_state.shape)
-        print("action", action.shape)
-        print("th.cat((latent_state, action), dim=1)", th.cat((latent_state, action), dim=1).shape)
-        print(
-            "self.linear(th.cat((latent_state, action), dim=1))",
-            self.linear(th.cat((latent_state, action), dim=1)).shape,
-        )
-        print(
-            "self.activation(self.linear(th.cat((latent_state, action), dim=1)))",
-            self.activation(self.linear(th.cat((latent_state, action), dim=1))).shape,
-        )
+        # print("recurrent_state", recurrent_state.shape)
+        # print("latent_state", latent_state.shape)
+        # print("action", action.shape)
+        # print("th.cat((latent_state, action), dim=1)", th.cat((latent_state, action), dim=1).shape)
+        # print(
+        #     "self.linear(th.cat((latent_state, action), dim=1))",
+        #     self.linear(th.cat((latent_state, action), dim=1)).shape,
+        # )
+        # print(
+        #     "self.activation(self.linear(th.cat((latent_state, action), dim=1)))",
+        #     self.activation(self.linear(th.cat((latent_state, action), dim=1))).shape,
+        # )
         return self.recurrent(self.activation(self.linear(th.cat((latent_state, action), dim=1))), recurrent_state)
 
 
@@ -324,25 +333,25 @@ class PriorNet(nn.Module):
         latent_classes: int = 16,
         net_arch: list[int] = [200, 200],
         activation_fn: type[nn.Module] = nn.Tanh,
-        uniformMix: float = 0.01,
+        uniform_mix: float = 0.01,
     ):
         super().__init__()
 
         self.latent_length = latent_length
         self.latent_classes = latent_classes
         self.latent_size = latent_length * latent_classes
-        self.uniformMix = uniformMix
+        self.uniform_mix = uniform_mix
 
         self.network = create_mlp(inputSize, self.latent_size, net_arch, activation_fn=activation_fn)
         self.network = nn.Sequential(*self.network)
 
     def forward(self, x):
-        print("forward Prior x", x.shape)
+        # print("forward Prior x", x.shape)
         rawLogits = self.network(x)
 
         probabilities = rawLogits.view(-1, self.latent_length, self.latent_classes).softmax(-1)
         uniform = th.ones_like(probabilities) / self.latent_classes
-        finalProbabilities = (1 - self.uniformMix) * probabilities + self.uniformMix * uniform
+        finalProbabilities = (1 - self.uniform_mix) * probabilities + self.uniform_mix * uniform
         logits = probs_to_logits(finalProbabilities)
 
         sample = Independent(OneHotCategoricalStraightThrough(logits=logits), 1).rsample()
@@ -372,11 +381,11 @@ class RewardModel(nn.Module):
 class ContinueModel(nn.Module):
     def __init__(self, inputSize, net_arch: list[int] = [400, 400, 400], activation_fn: type[nn.Module] = nn.Tanh):
         super().__init__()
-        self.network = create_mlp(inputSize, 2, net_arch, activation_fn=activation_fn)
+        self.network = create_mlp(inputSize, 1, net_arch, activation_fn=activation_fn)
         self.network = nn.Sequential(*self.network)
 
     def forward(self, x):
-        return Bernoulli(logits=self.network(x).squeeze(-1))
+        return Bernoulli(logits=self.network(x))
 
 
 class DreamerV3Policy(BasePolicy):
@@ -448,12 +457,12 @@ class DreamerV3Policy(BasePolicy):
         prior_net_kwargs={
             "net_arch": [200],
             "activation_fn": nn.Tanh,
-            "uniformMix": 0.01,
+            "uniform_mix": 0.01,
         },
         posterior_net_kwargs={
             "net_arch": [200],
             "activation_fn": nn.Tanh,
-            "uniformMix": 0.01,
+            "uniform_mix": 0.01,
         },
         reward_net_kwargs={
             "net_arch": [400, 400],
@@ -561,7 +570,7 @@ class DreamerV3Policy(BasePolicy):
         # -----------------------------------------------------------------------------
         # init world_model_optimizer
 
-        self.world_model_optimizer = (
+        self.world_model_parameters = (
             list(self.encoder.parameters())
             + list(self.decoder.parameters())
             + list(self.recurrent_model.parameters())
@@ -570,8 +579,9 @@ class DreamerV3Policy(BasePolicy):
             + list(self.reward_predictor.parameters())
             + list(self.continue_predictor.parameters())
         )
+
         self.world_model_optimizer = self.optimizer_class(
-            self.world_model_optimizer, lr=lr_schedule(1), **self.optimizer_kwargs  # type: ignore[call-arg]
+            self.world_model_parameters, lr=lr_schedule(1), **self.optimizer_kwargs  # type: ignore[call-arg]
         )
 
         # =============================================================================
@@ -589,7 +599,7 @@ class DreamerV3Policy(BasePolicy):
         }
         self.actor_kwargs.update(sde_kwargs)
 
-        print("self.actor_kwargs", self.actor_kwargs)
+        # print("self.actor_kwargs", self.actor_kwargs)
 
         self.actor = Actor(action_space, features_dim=self.full_state_size, **self.actor_kwargs).to(self.device)
         self.actor.optimizer = self.optimizer_class(
