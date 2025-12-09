@@ -28,9 +28,10 @@ def configure_callback(env, args, model_path: str = None):
     callbacks = [
         SaveConfigCallback(args, model_path),
         SaveBestNModelsCriticLoss(dir_path=model_path),
-        StateCoverageCallback(env, dir_path=model_path),
         SaveBestNModelsValueLoss(dir_path=model_path),
     ]
+    if args.env == "nav_2d":
+        callbacks.append(StateCoverageCallback(env, dir_path=model_path))
     return callbacks
 
 
@@ -58,12 +59,11 @@ def configure_logger(args):
 
 
 def configure_policy(args, env):
+    policy_kwargs = {}
 
-    policy_kwargs = {
-        "normalize_images": False,
-        "net_arch": eval(args.na),
-    }
     if args.alg == "dreamerv3":
+        if "features_extractor_kwargs" in args:
+            policy_kwargs["features_extractor_kwargs"] = args.features_extractor_kwargs
         if "latent_classes" in args:
             policy_kwargs["latent_classes"] = args.latent_classes
         if "recurrent_size" in args:
@@ -84,6 +84,13 @@ def configure_policy(args, env):
             policy_kwargs["actor_kwargs"] = args.actor
         if "critic" in args:
             policy_kwargs["critic_kwargs"] = args.critic
+    else:
+        policy_kwargs = {
+            "net_arch": args.na,
+        }
+
+    if "normalize_images" in args:
+        policy_kwargs["normalize_images"] = args.normalize_images
 
     return policy_kwargs
 
@@ -170,11 +177,12 @@ def configure_model(env, policy_kwargs, args):
     """Instantiates the appropriate model with provided configurations."""
     alg_name = args.alg
     model_args = {
-        "policy": "MlpPolicy",  # if args.ob == "pos" else "CnnPolicy",
+        "policy": args.policy,  # if args.ob == "pos" else "CnnPolicy",
         "env": env,
         "policy_kwargs": policy_kwargs,
         "verbose": 1,
     }
+
     # Dictionnaire pour associer chaque attribut `args` avec une clé `model_args`
     attributes = {
         "lr": "learning_rate",
@@ -286,10 +294,15 @@ def parse_args():
     add_argument_with_default("--it", None, type=int, help="Total number of iterations for training (e.g., 1000000).")
     add_argument_with_default("--bs", None, type=int, help="Batch size for training (e.g., 64).")
     add_argument_with_default("--load", None, type=str, help="Directory path to load the model checkpoint from.")
-    add_argument_with_default("--na", "[64,64]", type=str, help="net_arch of the policy.")
+    add_argument_with_default("--na", None, type=str, help="net_arch of mlp policy.")
     add_argument_with_default("--xp", None, type=str, help="experience name")
     add_argument_with_default("--run", None, type=str, help="run name")
     add_argument_with_default("--ga", None, type=float, help="gamma (e.g., 0.99).")
+    add_argument_with_default("--policy", "MlpPolicy", type=str, help="Policy type : MlpPolicy/CnnPolicy  ")
+    add_boolean_argument_with_default("--normalize_images", False, help="normalize_images.")
+    add_argument_with_default("--features_extractor_kwargs", None, help="features_extractor_kwargs")
+    add_argument_with_default("--buffer_size", 1.0e6, help="buffer_size")
+
     add_argument_with_default("--latent_classes", None, help="latent_classes")
     add_argument_with_default("--latent_length", None, help="latent_length")
     add_argument_with_default("--recurrent_size", None, help="recurrent_size")

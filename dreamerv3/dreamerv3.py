@@ -14,7 +14,7 @@ from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedul
 from stable_baselines3.common.utils import get_parameters_by_name, polyak_update
 from dreamerv3.policy import (
     MlpPolicy,
-    # CnnPolicy,
+    CnnPolicy,
     # MultiInputPolicy,
     DreamerV3Policy,
     Actor,
@@ -41,6 +41,7 @@ from stable_baselines3.common.type_aliases import (
 from stable_baselines3.common.utils import should_collect_more_steps
 from stable_baselines3.common.vec_env import VecNormalize
 from stable_baselines3.common.type_aliases import ReplayBufferSamples
+from stable_baselines3.common.preprocessing import preprocess_obs
 
 
 SelfDreamerV3 = TypeVar("SelfDreamerV3", bound="DreamerV3")
@@ -234,20 +235,20 @@ class DreamerV3(OffPolicyAlgorithm):
 
     policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
         "MlpPolicy": MlpPolicy,
-        # "CnnPolicy": CnnPolicy,
+        "CnnPolicy": CnnPolicy,
         # "MultiInputPolicy": MultiInputPolicy,
     }
     policy: DreamerV3Policy
     actor: Actor
     critic: Critic
     critic_target: Critic
-    # encoder: MLPEncoder
-    # decoder: MLPDecoder
-    # recurrentModel: RecurrentModel
-    # priorNet: PriorNet
-    # posteriorNet: PosteriorNet
-    # rewardPredictor: RewardModel
-    # continuePredictor: ContinueModel
+    encoder: MLPEncoder
+    decoder: MLPDecoder
+    recurrentModel: RecurrentModel
+    priorNet: PriorNet
+    posteriorNet: PosteriorNet
+    rewardPredictor: RewardModel
+    continuePredictor: ContinueModel
 
     def __init__(
         self,
@@ -413,9 +414,14 @@ class DreamerV3(OffPolicyAlgorithm):
                 self.actor.reset_noise()
 
             # *** Transform [batch_size, sequence_length, obs.shape] → [batch_size * sequence_length, obs_shape]
-            flat_observations = replay_data.observations.view(-1, 2)
+            observation_shape = self.policy.encoder._observation_space.shape
 
-            observation_shape = flat_observations[0].shape
+            flat_observations = replay_data.observations.view(-1, *observation_shape)
+
+            # *** preprocess_obs
+            flat_observations = preprocess_obs(
+                flat_observations, self.observation_space, normalize_images=self.policy.normalize_images
+            )
 
             # *** encode flat obs and transform [batch_size *sequence_length, features_dim] → [batch_size , sequence_length, features_dim]
             encoded_observations = self.policy.encoder(flat_observations).view(
@@ -437,7 +443,7 @@ class DreamerV3(OffPolicyAlgorithm):
                 # *** prior     output is a *discrete latent state*, which only comes from *recurrent_state* (but logits are contineous).
                 _, prior_logits = self.policy.prior_net(recurrent_state)
 
-                # *** posterior output is a discrete latent state*, which comes from *both recurrent_state AND encoded_observations*
+                # *** posterior output is a *discrete latent state*, which comes from both *recurrent_state* AND *encoded_observations*
                 # *** posterior is more relyable because it contains encoded_observations in addition
                 posterior, posterior_logits = self.policy.posterior_net(
                     th.cat((recurrent_state, encoded_observations[:, t]), -1)
@@ -835,6 +841,11 @@ class DreamerV3(OffPolicyAlgorithm):
                 self.recurrent_states = self.policy.recurrent_model(
                     self.recurrent_states, self.discrete_latent_states, self.last_buffer_actions
                 )
+
+                last_observations = preprocess_obs(
+                    last_observations, self.observation_space, normalize_images=self.policy.normalize_images
+                )
+
                 encoded_last_obs = self.policy.encoder(last_observations)
                 self.discrete_latent_states, _ = self.policy.posterior_net(
                     th.cat((self.recurrent_states, encoded_last_obs), dim=1)

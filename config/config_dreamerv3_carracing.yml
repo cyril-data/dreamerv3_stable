@@ -1,0 +1,73 @@
+env: "CarRacing-v3"  # continuous navigation 2d 
+nenv: 1
+
+alg: dreamerv3            # type algo : ppo, dqn, sacd or lsfm
+lr: 1.0e-3          # learning rate
+it: !!float 50000   # number of interations
+bs: 2             # batch_size if off policy
+learning_starts: 3000
+policy: CnnPolicy
+buffer_size: 100_000,  # 1e5
+
+features_extractor_kwargs: 
+  features_dim: 1024
+  normalized_image: false
+  channels: 
+    - 16
+    - 32
+    - 64
+    - 128
+  kernels: 
+    - 4
+    - 4
+    - 4
+    - 4
+  strides: 
+    - 2
+    - 2
+    - 2
+    - 2
+  paddings: 
+    - 1
+    - 1
+    - 1
+    - 1
+
+actor:
+  random: false
+  net_arch: 
+  - 400
+  - 400
+
+critic:
+  net_arch: 
+    - 400
+    - 400
+    - 400
+
+latent_classes: 16
+latent_length:  16
+recurrent_size:  512
+
+recurrent_model:
+  hidden_size: 200
+
+prior_net:
+  net_arch: 
+  - 200
+  uniform_mix: 0.01
+
+posterior_net:
+  net_arch: 
+  - 200
+  uniform_mix: 0.01
+
+reward_net:
+  net_arch: 
+  - 400
+  - 400
+
+continue_net:
+  net_arch: 
+    - 400
+    - 400

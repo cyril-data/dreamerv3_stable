@@ -17,15 +17,12 @@ from stable_baselines3.common.type_aliases import TensorDict
 
 from torch.distributions.utils import probs_to_logits
 from torch.distributions import Independent, OneHotCategoricalStraightThrough, Normal, Bernoulli
-
-
 from stable_baselines3.common.policies import BasePolicy, ContinuousCritic, BaseModel
 from stable_baselines3.common.preprocessing import get_action_dim
 from stable_baselines3.common.torch_layers import (
     BaseFeaturesExtractor,
     CombinedExtractor,
     FlattenExtractor,
-    NatureCNN,
     create_mlp,
     get_actor_critic_arch,
 )
@@ -41,9 +38,9 @@ class MLPEncoder(BaseFeaturesExtractor):
     def __init__(
         self,
         observation_space: gym.Space,
-        net_arch: list[int],
+        net_arch: list[int] = [64, 64],
         features_dim: int = 64,
-        activation_fn: nn.Module = nn.Tanh(),
+        activation_fn: nn.Module = nn.Tanh,
     ) -> None:
         super().__init__(observation_space, features_dim)
 
@@ -61,9 +58,9 @@ class MLPDecoder(nn.Module):
     def __init__(
         self,
         observation_space: gym.Space,
-        net_arch: list[int],
+        net_arch: list[int] = [64, 64],
         features_dim: int = 64,
-        activation_fn: nn.Module = nn.Tanh(),
+        activation_fn: nn.Module = nn.Tanh,
     ) -> None:
         super().__init__()
 
@@ -81,6 +78,253 @@ class MLPDecoder(nn.Module):
     def forward(self, features_dim: th.Tensor) -> th.Tensor:
         return self.decoder(features_dim)
 
+
+class NatureCNNEncoder(BaseFeaturesExtractor):
+    """
+    CNN from DQN Nature paper with configurable architecture.
+
+    :param observation_space: The observation space of the environment
+    :param features_dim: Number of features extracted.
+    :param normalized_image: Whether to assume that the image is already normalized
+    :param channels: List of output channels for each conv layer
+    :param kernels: List of kernel sizes for each conv layer
+    :param strides: List of strides for each conv layer
+    :param paddings: List of paddings for each conv layer
+    :param activation: Activation function to use
+    """
+
+    def __init__(
+        self,
+        observation_space: gym.Space,
+        features_dim: int = 512,
+        normalized_image: bool = False,
+        channels: list = [32, 64, 64],
+        kernels: list = [8, 4, 3],
+        strides: list = [4, 2, 1],
+        paddings: list = [0, 0, 0],
+        activation: callable = nn.Tanh,
+    ) -> None:
+        assert isinstance(observation_space, spaces.Box), (
+            "NatureCNN must be used with a gym.spaces.Box ",
+            f"observation space, not {observation_space}",
+        )
+        super().__init__(observation_space, features_dim)
+
+        # Validation des paramètres
+        assert (
+            len(channels) == len(kernels) == len(strides) == len(paddings)
+        ), "channels, kernels, strides and paddings must have the same length"
+
+        n_input_channels = observation_space.shape[0]
+
+        # Construction des couches convolutives
+        conv_layers = []
+        in_channels = n_input_channels
+
+        for i, (out_channels, kernel_size, stride, padding) in enumerate(zip(channels, kernels, strides, paddings)):
+            conv_layers.extend(
+                [
+                    nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding),
+                    activation(),
+                ]
+            )
+            in_channels = out_channels
+
+        conv_layers.append(nn.Flatten())
+
+        self.cnn = nn.Sequential(*conv_layers)
+
+        # Compute shape by doing one forward pass
+        with th.no_grad():
+            sample_input = th.as_tensor(observation_space.sample()[None]).float()
+            n_flatten = self.cnn(sample_input).shape[1]
+
+        self.linear = nn.Sequential(nn.Linear(n_flatten, features_dim), activation())
+
+        # Stockage des paramètres pour référence
+        self.architecture_params = {
+            "channels": channels,
+            "kernels": kernels,
+            "strides": strides,
+            "paddings": paddings,
+            "input_shape": observation_space.shape,
+            "flatten_dim": n_flatten,
+        }
+
+    def forward(self, observations: th.Tensor) -> th.Tensor:
+        return self.linear(self.cnn(observations))
+
+
+class NatureCNNDecoder(BaseFeaturesExtractor):
+    """
+    Decoder corresponding to the NatureCNN architecture with same parameters as encoder.
+
+    :param observation_space: The observation space that we want to reconstruct
+    :param features_dim: Dimension of the latent input vector
+    :param normalized_image: Whether to assume that the image is already normalized
+    :param channels: List of channels for each conv layer in the encoder
+    :param kernels: List of kernel sizes for each conv layer in the encoder
+    :param strides: List of strides for each conv layer in the encoder
+    :param paddings: List of paddings for each conv layer in the encoder
+    :param activation: Activation function to use
+    """
+
+    def __init__(
+        self,
+        observation_space: gym.Space,
+        features_dim: int = 512,
+        normalized_image: bool = False,
+        channels: list = [32, 64, 64],
+        kernels: list = [8, 4, 3],
+        strides: list = [4, 2, 1],
+        paddings: list = [0, 0, 0],
+        activation: callable = nn.Tanh,
+    ) -> None:
+        assert isinstance(observation_space, spaces.Box), (
+            "NatureDecoder must be used with a gym.spaces.Box ",
+            f"observation space, not {observation_space}",
+        )
+        # For the decoder, features_dim is the latent input dimension
+        super().__init__(observation_space, features_dim)
+
+        # Validate parameters
+        assert (
+            len(channels) == len(kernels) == len(strides) == len(paddings)
+        ), "channels, kernels, strides and paddings must have the same length"
+
+        self.latent_dim = features_dim
+        self.output_channels = observation_space.shape[0]
+        self.input_height = observation_space.shape[1]
+        self.input_width = observation_space.shape[2]
+
+        # Calculate spatial dimensions at each step of the encoder
+        self.encoder_spatial_dims = self._compute_encoder_output_shape(
+            self.input_height, self.input_width, kernels, strides, paddings
+        )
+
+        # The last spatial dimension corresponds to the decoder input
+        final_height, final_width = self.encoder_spatial_dims[-1]
+
+        self.final_channels = channels[-1]  # Last channel of encoder = first of decoder
+        self.n_flatten = self.final_channels * final_height * final_width
+
+        # Linear layer to project from latent space to spatial flattened space
+        self.linear = nn.Sequential(nn.Linear(features_dim, self.n_flatten), activation())
+
+        # Build transpose convolution layers (reverse order of encoder)
+        tconv_layers = []
+
+        # Reverse parameters for the decoder
+        # We need channels in reverse order: [last_encoder_channel, ..., first_encoder_channel, output_channels]
+        decoder_channels = [channels[-1]] + channels[:-1] + [self.output_channels]
+
+        # Reverse other parameters
+        decoder_kernels = kernels[::-1]  # [8, 4, 3] -> [3, 4, 8]
+        decoder_strides = strides[::-1]  # [4, 2, 1] -> [1, 2, 4]
+        decoder_paddings = paddings[::-1]  # [0, 0, 0] -> [0, 0, 0]
+
+        # Calculate output_padding to get exact original dimensions
+        decoder_output_paddings = self._compute_output_padding(
+            self.encoder_spatial_dims, decoder_kernels, decoder_strides, decoder_paddings
+        )
+
+        in_channels = decoder_channels[0]
+
+        # Build transpose conv layers
+        for i, (out_channels, kernel_size, stride, padding, output_padding) in enumerate(
+            zip(decoder_channels[1:], decoder_kernels, decoder_strides, decoder_paddings, decoder_output_paddings)
+        ):
+            # Create ConvTranspose2d layer
+            tconv_layers.append(
+                nn.ConvTranspose2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=kernel_size,
+                    stride=stride,
+                    padding=padding,
+                    output_padding=output_padding,
+                )
+            )
+
+            # No activation after the final layer (output layer)
+            if i < len(decoder_channels) - 2:
+                tconv_layers.append(activation())
+
+            in_channels = out_channels
+
+        self.decoder = nn.Sequential(*tconv_layers)
+
+        # Store parameters for reference
+        self.architecture_params = {
+            "channels": channels,
+            "kernels": kernels,
+            "strides": strides,
+            "paddings": paddings,
+            "encoder_spatial_dims": self.encoder_spatial_dims,
+            "output_shape": observation_space.shape,
+            "decoder_channels": decoder_channels,
+            "decoder_kernels": decoder_kernels,
+            "decoder_strides": decoder_strides,
+            "decoder_paddings": decoder_paddings,
+            "decoder_output_paddings": decoder_output_paddings,
+        }
+
+    def _compute_encoder_output_shape(self, input_h, input_w, kernels, strides, paddings):
+        """Calculate spatial dimensions at each step of the encoder"""
+        spatial_dims = [(input_h, input_w)]
+
+        h, w = input_h, input_w
+        for kernel, stride, padding in zip(kernels, strides, paddings):
+            h = (h + 2 * padding - kernel) // stride + 1
+            w = (w + 2 * padding - kernel) // stride + 1
+            spatial_dims.append((h, w))
+
+        return spatial_dims
+
+    def _compute_output_padding(self, encoder_dims, decoder_kernels, decoder_strides, decoder_paddings):
+        """
+        Calculate the output_padding needed for ConvTranspose2d layers
+        to get exactly the target dimensions (reverse of encoder steps).
+        """
+        output_paddings = []
+
+        # Start from the last encoder dimension and go backward
+        current_h, current_w = encoder_dims[-1]
+
+        for i in range(len(decoder_kernels)):
+            # Target dimension is the encoder dimension at the corresponding step (from the end)
+            target_h, target_w = encoder_dims[-(i + 2)]
+
+            # Calculate output dimension without output_padding
+            out_h = (current_h - 1) * decoder_strides[i] - 2 * decoder_paddings[i] + decoder_kernels[i]
+            out_w = (current_w - 1) * decoder_strides[i] - 2 * decoder_paddings[i] + decoder_kernels[i]
+
+            # Calculate needed output_padding
+            output_padding_h = target_h - out_h
+            output_padding_w = target_w - out_w
+
+            # Convert to tuple for ConvTranspose2d
+            output_paddings.append((output_padding_h, output_padding_w))
+
+            # Update for next iteration
+            current_h, current_w = target_h, target_w
+
+        return output_paddings
+
+    def forward(self, latent: th.Tensor) -> th.Tensor:
+        batch_size = latent.shape[0]
+
+        # Linear projection from latent space to flattened spatial space
+        x = self.linear(latent)
+
+        # Reshape to the final spatial dimensions of the encoder
+        final_h, final_w = self.encoder_spatial_dims[-1]
+        x = x.view(batch_size, self.final_channels, final_h, final_w)
+
+        # Apply transpose convolutions to reconstruct the image
+        x = self.decoder(x)
+
+        return x
 
 class Actor(nn.Module):
     """
@@ -433,8 +677,8 @@ class DreamerV3Policy(BasePolicy):
         observation_space: spaces.Space,
         action_space: spaces.Box,
         lr_schedule: Schedule,
-        net_arch: Optional[Union[list[int], dict[str, list[int]]]] = None,
-        activation_fn: type[nn.Module] = nn.Tanh,
+        # net_arch: Optional[Union[list[int], dict[str, list[int]]]] = None,
+        # activation_fn: type[nn.Module] = nn.Tanh,
         use_sde: bool = False,
         log_std_init: float = -3,
         use_expln: bool = False,
@@ -499,13 +743,12 @@ class DreamerV3Policy(BasePolicy):
         self.full_state_size = recurrent_size + self.latent_size
         self.action_dim = get_action_dim(self.action_space)
 
-        if net_arch is None:
-            net_arch = [64, 64]
-
         # -----------------------------------------------------------------------------
         # init encoder
         self.encoder = features_extractor_class(
-            observation_space, net_arch=net_arch, activation_fn=activation_fn, **features_extractor_kwargs
+            observation_space,
+            # net_arch=net_arch, activation_fn=activation_fn,
+            **features_extractor_kwargs,
         ).to(self.device)
 
         if not isinstance(self.encoder, MLPEncoder):
@@ -523,13 +766,24 @@ class DreamerV3Policy(BasePolicy):
 
         self.encoded_obs_size = self.encoder.features_dim
 
+        # # init decoder
+        # self.decoder = features_decoder_class(
+        #     observation_space=self.encoder.observation_space,
+        #     net_arch=self.encoder.net_arch,
+        #     features_dim=self.full_state_size,
+        #     activation_fn=self.encoder.activation_fn,
+        # ).to(self.device)
+
         # -----------------------------------------------------------------------------
         # init decoder
+        features_extractor_kwargs["features_dim"] = self.full_state_size
+        print("features_extractor_kwargs", features_extractor_kwargs)
+
         self.decoder = features_decoder_class(
             observation_space,
-            features_dim=self.full_state_size,
-            net_arch=net_arch,
-            activation_fn=activation_fn,
+            # net_arch=net_arch,
+            # activation_fn=activation_fn,
+            **features_extractor_kwargs,
         ).to(self.device)
 
         # -----------------------------------------------------------------------------
@@ -630,8 +884,6 @@ class DreamerV3Policy(BasePolicy):
 
         data.update(
             dict(
-                net_arch=self.net_arch,
-                activation_fn=self.net_args["activation_fn"],
                 use_sde=self.actor_kwargs["use_sde"],
                 log_std_init=self.actor_kwargs["log_std_init"],
                 use_expln=self.actor_kwargs["use_expln"],
@@ -741,17 +993,6 @@ class DreamerV3Policy(BasePolicy):
 
         return self.actor(th.cat((recurrent_state, latent_state), dim=1), deterministic)
 
-    def extract_features(self, obs: PyTorchObs, features_extractor: BaseFeaturesExtractor) -> th.Tensor:
-        """
-        Preprocess the observation if needed and extract features.
-
-        :param obs: Observation
-        :param features_extractor: The features extractor to use.
-        :return: The extracted features
-        """
-        preprocessed_obs = preprocess_obs(obs, self.observation_space, normalize_images=self.normalize_images)
-        return features_extractor(preprocessed_obs)
-
     # =====================================================================================
     # =====================================================================================
     # =====================================================================================
@@ -777,267 +1018,102 @@ class DreamerV3Policy(BasePolicy):
 MlpPolicy = DreamerV3Policy
 
 
-# class NatureCNNEncoder(BaseFeaturesExtractor):
-#     """
-#     CNN from DQN Nature paper with configurable architecture.
+class CnnPolicy(DreamerV3Policy):
+    """
+    CNN from DQN Nature paper with configurable architecture.
 
-#     :param observation_space: The observation space of the environment
-#     :param features_dim: Number of features extracted.
-#     :param normalized_image: Whether to assume that the image is already normalized
-#     :param channels: List of output channels for each conv layer
-#     :param kernels: List of kernel sizes for each conv layer
-#     :param strides: List of strides for each conv layer
-#     :param paddings: List of paddings for each conv layer
-#     :param activation: Activation function to use
-#     """
+    :param observation_space: The observation space of the environment
+    :param features_dim: Number of features extracted.
+    :param normalized_image: Whether to assume that the image is already normalized
+    :param channels: List of output channels for each conv layer
+    :param kernels: List of kernel sizes for each conv layer
+    :param strides: List of strides for each conv layer
+    :param paddings: List of paddings for each conv layer
+    :param activation: Activation function to use
+    """
 
-#     def __init__(
-#         self,
-#         observation_space: gym.Space,
-#         features_dim: int = 512,
-#         normalized_image: bool = False,
-#         channels: list = [32, 64, 64],
-#         kernels: list = [8, 4, 3],
-#         strides: list = [4, 2, 1],
-#         paddings: list = [0, 0, 0],
-#         activation: callable = nn.Tanh,
-#     ) -> None:
-#         assert isinstance(observation_space, spaces.Box), (
-#             "NatureCNN must be used with a gym.spaces.Box ",
-#             f"observation space, not {observation_space}",
-#         )
-#         super().__init__(observation_space, features_dim)
-
-#         # Validation des paramètres
-#         assert (
-#             len(channels) == len(kernels) == len(strides) == len(paddings)
-#         ), "channels, kernels, strides and paddings must have the same length"
-
-#         n_input_channels = observation_space.shape[0]
-
-#         # Construction des couches convolutives
-#         conv_layers = []
-#         in_channels = n_input_channels
-
-#         for i, (out_channels, kernel_size, stride, padding) in enumerate(zip(channels, kernels, strides, paddings)):
-#             conv_layers.extend(
-#                 [
-#                     nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding),
-#                     activation(),
-#                 ]
-#             )
-#             in_channels = out_channels
-
-#         conv_layers.append(nn.Flatten())
-
-#         self.cnn = nn.Sequential(*conv_layers)
-
-#         # Compute shape by doing one forward pass
-#         with th.no_grad():
-#             sample_input = th.as_tensor(observation_space.sample()[None]).float()
-#             n_flatten = self.cnn(sample_input).shape[1]
-
-#         self.linear = nn.Sequential(nn.Linear(n_flatten, features_dim), activation())
-
-#         # Stockage des paramètres pour référence
-#         self.architecture_params = {
-#             "channels": channels,
-#             "kernels": kernels,
-#             "strides": strides,
-#             "paddings": paddings,
-#             "input_shape": observation_space.shape,
-#             "flatten_dim": n_flatten,
-#         }
-
-#     def forward(self, observations: th.Tensor) -> th.Tensor:
-#         return self.linear(self.cnn(observations))
-
-
-# class NatureCNNDecoder(BaseFeaturesExtractor):
-#     """
-#     Decoder corresponding to the NatureCNN architecture with same parameters as encoder.
-
-#     :param observation_space: The observation space that we want to reconstruct
-#     :param features_dim: Dimension of the latent input vector
-#     :param normalized_image: Whether to assume that the image is already normalized
-#     :param channels: List of channels for transpose conv layers (in reverse order)
-#     :param kernels: List of kernel sizes for transpose conv layers
-#     :param strides: List of strides for transpose conv layers
-#     :param paddings: List of paddings for transpose conv layers
-#     :param activation: Activation function to use
-#     """
-
-#     def __init__(
-#         self,
-#         observation_space: gym.Space,
-#         features_dim: int = 512,
-#         normalized_image: bool = False,
-#         channels: list = [32, 64, 64],
-#         kernels: list = [8, 4, 3],
-#         strides: list = [4, 2, 1],
-#         paddings: list = [0, 0, 0],
-#         activation: callable = nn.Tanh,
-#     ) -> None:
-#         assert isinstance(observation_space, spaces.Box), (
-#             "NatureDecoder must be used with a gym.spaces.Box ",
-#             f"observation space, not {observation_space}",
-#         )
-#         # Pour le decoder, features_dim est la dimension d'entrée latente
-#         super().__init__(observation_space, features_dim)
-
-#         # Validation des paramètres
-#         assert (
-#             len(channels) == len(kernels) == len(strides) == len(paddings)
-#         ), "channels, kernels, strides and paddings must have the same length"
-
-#         self.latent_dim = features_dim
-#         self.output_channels = observation_space.shape[0]
-#         self.output_height = observation_space.shape[1]
-#         self.output_width = observation_space.shape[2]
-
-#         # Calcul des dimensions spatiales de l'encodeur pour déterminer l'entrée du décodeur
-#         spatial_dims = self._compute_encoder_output_shape(
-#             self.output_height, self.output_width, kernels, strides, paddings
-#         )
-
-#         # La dernière dimension spatiale correspond à l'entrée du décodeur
-#         final_height, final_width = spatial_dims[-1]
-#         self.final_channels = channels[-1]  # Dernier canal de l'encodeur = premier du décodeur
-
-#         self.n_flatten = self.final_channels * final_height * final_width
-
-#         # Couche linéaire pour projeter l'espace latent vers l'espace spatial
-#         self.linear = nn.Sequential(nn.Linear(features_dim, self.n_flatten), activation())
-
-#         # Construction des couches de convolution transposée (ordre inverse de l'encodeur)
-#         tconv_layers = []
-
-#         # Inversion des paramètres pour le décodeur
-#         decoder_channels = [channels[-1]] + channels[:-1]  # [64, 64, 32] -> [64, 32, output_channels]
-#         decoder_kernels = kernels[::-1]  # [8, 4, 3] -> [3, 4, 8]
-#         decoder_strides = strides[::-1]  # [4, 2, 1] -> [1, 2, 4]
-#         decoder_paddings = paddings[::-1]  # [0, 0, 0] -> [0, 0, 0]
-
-#         in_channels = decoder_channels[0]
-
-#         for i, (out_channels, kernel_size, stride, padding) in enumerate(
-#             zip(decoder_channels[1:], decoder_kernels, decoder_strides, decoder_paddings)
-#         ):
-#             is_final_layer = i == len(decoder_channels) - 2
-#             current_out_channels = self.output_channels if is_final_layer else out_channels
-
-#             tconv_layers.append(
-#                 nn.ConvTranspose2d(
-#                     in_channels, current_out_channels, kernel_size=kernel_size, stride=stride, padding=padding
-#                 )
-#             )
-
-#             if not is_final_layer:
-#                 tconv_layers.append(activation())
-
-#             in_channels = out_channels
-
-#         self.decoder = nn.Sequential(*tconv_layers)
-
-#         # Stockage des paramètres pour référence
-#         self.architecture_params = {
-#             "channels": channels,
-#             "kernels": kernels,
-#             "strides": strides,
-#             "paddings": paddings,
-#             "final_spatial_dims": (final_height, final_width),
-#             "output_shape": observation_space.shape,
-#             "decoder_channels": decoder_channels,
-#             "decoder_kernels": decoder_kernels,
-#             "decoder_strides": decoder_strides,
-#             "decoder_paddings": decoder_paddings,
-#         }
-
-#     def _compute_encoder_output_shape(self, input_h, input_w, kernels, strides, paddings):
-#         """Calcule les dimensions spatiales à chaque étape de l'encodeur"""
-#         spatial_dims = [(input_h, input_w)]
-
-#         h, w = input_h, input_w
-#         for kernel, stride, padding in zip(kernels, strides, paddings):
-#             h = (h + 2 * padding - kernel) // stride + 1
-#             w = (w + 2 * padding - kernel) // stride + 1
-#             spatial_dims.append((h, w))
-
-#         return spatial_dims
-
-#     def forward(self, latent: th.Tensor) -> th.Tensor:
-#         batch_size = latent.shape[0]
-
-#         # Projection linéaire de l'espace latent vers l'espace spatial flatten
-#         x = self.linear(latent)
-
-#         # Reshape vers les dimensions spatiales finales de l'encodeur
-#         x = x.view(
-#             batch_size,
-#             self.final_channels,
-#             self.architecture_params["final_spatial_dims"][0],
-#             self.architecture_params["final_spatial_dims"][1],
-#         )
-
-#         # Application des convolutions transposées pour reconstruire l'image
-#         x = self.decoder(x)
-
-#         return x
-
-
-# class CNNPolicyEncoder(DreamerV3Policy):
-#     """
-#     CNN from DQN Nature paper with configurable architecture.
-
-#     :param observation_space: The observation space of the environment
-#     :param features_dim: Number of features extracted.
-#     :param normalized_image: Whether to assume that the image is already normalized
-#     :param channels: List of output channels for each conv layer
-#     :param kernels: List of kernel sizes for each conv layer
-#     :param strides: List of strides for each conv layer
-#     :param paddings: List of paddings for each conv layer
-#     :param activation: Activation function to use
-#     """
-
-#     def __init__(
-#         self,
-#         observation_space: spaces.Space,
-#         action_space: spaces.Box,
-#         lr_schedule: Schedule,
-#         net_arch: Optional[Union[list[int], dict[str, list[int]]]] = None,
-#         activation_fn: type[nn.Module] = nn.Tanh,
-#         use_sde: bool = False,
-#         log_std_init: float = -3,
-#         use_expln: bool = False,
-#         clip_mean: float = 2.0,
-#         features_extractor_class: type[BaseFeaturesExtractor] = NatureCNNEncoder,
-#         features_extractor_kwargs: Optional[dict[str, Any]] = None,
-#         normalize_images: bool = True,
-#         optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
-#         optimizer_kwargs: Optional[dict[str, Any]] = None,
-#         features_decoder_class: type[BaseFeaturesExtractor] = NatureCNNDecoder,
-#     ) -> None:
-#         assert isinstance(observation_space, spaces.Box), (
-#             "NatureCNNEncoder must be used with a gym.spaces.Box ",
-#             f"observation space, not {observation_space}",
-#         )
-#         super().__init__(
-#             observation_space,
-#             action_space,
-#             lr_schedule,
-#             net_arch,
-#             activation_fn,
-#             use_sde,
-#             log_std_init,
-#             use_expln,
-#             clip_mean,
-#             features_extractor_class,
-#             features_extractor_kwargs,
-#             normalize_images,
-#             optimizer_class,
-#             optimizer_kwargs,
-#             features_decoder_class,
-#         )
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Box,
+        lr_schedule: Schedule,
+        net_arch: Optional[Union[list[int], dict[str, list[int]]]] = None,
+        activation_fn: type[nn.Module] = nn.Tanh,
+        use_sde: bool = False,
+        log_std_init: float = -3,
+        use_expln: bool = False,
+        clip_mean: float = 2.0,
+        features_extractor_class: type[BaseFeaturesExtractor] = NatureCNNEncoder,
+        features_extractor_kwargs: Optional[dict[str, Any]] = {
+            "features_dim": 64,
+        },
+        normalize_images: bool = True,
+        optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
+        optimizer_kwargs: Optional[dict[str, Any]] = None,
+        features_decoder_class: type[BaseFeaturesExtractor] = NatureCNNDecoder,
+        latent_classes: int = 16,
+        recurrent_size: int = 512,
+        latent_length: int = 16,
+        recurrent_model_kwargs={
+            "hidden_size": 200,
+            "activation_fn": nn.Tanh,
+        },
+        prior_net_kwargs={
+            "net_arch": [200],
+            "activation_fn": nn.Tanh,
+            "uniform_mix": 0.01,
+        },
+        posterior_net_kwargs={
+            "net_arch": [200],
+            "activation_fn": nn.Tanh,
+            "uniform_mix": 0.01,
+        },
+        reward_net_kwargs={
+            "net_arch": [400, 400],
+            "activation_fn": nn.Tanh,
+        },
+        continue_net_kwargs={
+            "net_arch": [400, 400, 400],
+            "activation_fn": nn.Tanh,
+        },
+        actor_kwargs={
+            "net_arch": [400, 400],
+            "activation_fn": nn.Tanh,
+        },
+        critic_kwargs={
+            "net_arch": [400, 400, 400],
+            "activation_fn": nn.Tanh,
+        },
+    ) -> None:
+        assert isinstance(observation_space, spaces.Box), (
+            "NatureCNNEncoder must be used with a gym.spaces.Box ",
+            f"observation space, not {observation_space}",
+        )
+        super().__init__(
+            observation_space,
+            action_space,
+            lr_schedule,
+            use_sde,
+            log_std_init,
+            use_expln,
+            clip_mean,
+            features_extractor_class,
+            features_extractor_kwargs,
+            normalize_images,
+            optimizer_class,
+            optimizer_kwargs,
+            features_decoder_class,
+            latent_classes,
+            recurrent_size,
+            latent_length,
+            recurrent_model_kwargs,
+            prior_net_kwargs,
+            posterior_net_kwargs,
+            reward_net_kwargs,
+            continue_net_kwargs,
+            actor_kwargs,
+            critic_kwargs,
+        )
 
 
 # class CombinedEncoder(BaseFeaturesExtractor):
