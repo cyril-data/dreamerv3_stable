@@ -131,6 +131,10 @@ def configure_env(args):
     if "ip" in args:
         if args.ip is not None:
             env_kwargs["init_pos"] = eval(args.ip)
+    if "seed" in args:
+        seed = args.seed
+    else:
+        seed = 0
 
     # Get number of environments (default to 1 if not specified)
     n_envs = getattr(args, "nenv", 1)
@@ -138,10 +142,10 @@ def configure_env(args):
     # Create vectorized environment
     if env_name in custom_envs:
         env_class = custom_envs[env_name]
-        vec_env = make_vec_env(env_class, n_envs=n_envs, seed=0, env_kwargs=env_kwargs)
+        vec_env = make_vec_env(env_class, n_envs=n_envs, seed=seed, env_kwargs=env_kwargs)
     else:
         vec_env = make_vec_env(
-            env_name, n_envs=n_envs, seed=0, env_kwargs={"render_mode": render_mode} if render_mode else {}
+            env_name, n_envs=n_envs, seed=seed, env_kwargs={"render_mode": render_mode} if render_mode else {}
         )
 
     # Note: Manual control and inspection work differently with vectorized envs
@@ -152,7 +156,7 @@ def configure_env(args):
 
         if "manual" in args and args.manual:
             print("Manual control enabled")
-            manual_control = ManualControl(single_env, seed=42)
+            manual_control = ManualControl(single_env, seed=seed)
             manual_control.start()
     else:
         # For multiple envs, inspect the first one
@@ -176,11 +180,17 @@ def configure_env(args):
 def configure_model(env, policy_kwargs, args):
     """Instantiates the appropriate model with provided configurations."""
     alg_name = args.alg
+    if "seed" in args:
+        seed = args.seed
+    else:
+        seed = 0
+
     model_args = {
         "policy": args.policy,  # if args.ob == "pos" else "CnnPolicy",
         "env": env,
         "policy_kwargs": policy_kwargs,
         "verbose": 1,
+        "seed": seed,
     }
 
     # Dictionnaire pour associer chaque attribut `args` avec une clé `model_args`
@@ -231,6 +241,7 @@ def configure_model(env, policy_kwargs, args):
 
     num_of_parameters = sum(map(th.numel, model.policy.parameters()))
     print("Total number of parameters", num_of_parameters, "\n")
+    print("SEED", seed)
     return model
 
 
@@ -313,6 +324,7 @@ def parse_args():
     add_argument_with_default("--continue_net", None, help="continue_net")
     add_argument_with_default("--actor", None, help="actor")
     add_argument_with_default("--critic", None, help="critic")
+    add_argument_with_default("--seed", None, type=int, help="seed fo all")
 
     # joined = "_" + "_".join([f"{k.lstrip('-')}{v}" for k, v in zip(remaining_argv[::2], remaining_argv[1::2])])
     joined = "_" + "_".join(
