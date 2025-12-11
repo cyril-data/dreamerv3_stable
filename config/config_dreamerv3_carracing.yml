@@ -3,9 +3,9 @@ nenv: 1
 
 alg: dreamerv3            # type algo : ppo, dqn, sacd or lsfm
 lr: 1.0e-3          # learning rate
-it: !!float 50000   # number of interations
+it: !!float 1000000   # number of interations
 bs: 2             # batch_size if off policy
-learning_starts: 3000
+learning_starts: 10000
 policy: CnnPolicy
 buffer_size: 100_000,  # 1e5
 
